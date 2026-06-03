@@ -1,0 +1,19 @@
+{
+  "name": "@msword/agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "module": "src/index.ts",
+  "scripts": {
+    "dev": "bun --watch run src/index.ts",
+    "build": "bun build --compile --target=bun-windows-x64 --outfile ../desktop/src-tauri/binaries/bun-agent-x86_64-pc-windows-msvc.exe src/index.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.40.0",
+    "@msword/rpc-schema": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.6.0"
+  }
+}

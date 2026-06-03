@@ -1,0 +1,24 @@
+{
+  "name": "msword-use-desktop",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Drive Microsoft Word from a desktop UI via natural language",
+  "workspaces": [
+    "apps/desktop",
+    "apps/agent",
+    "packages/*"
+  ],
+  "scripts": {
+    "gen": "bun run scripts/gen-rpc-types.ts",
+    "driver:build": "cd drivers/WordDriver && dotnet build -c Debug",
+    "driver:test": "bun run scripts/test-sidecar.ts",
+    "dev": "cd apps/desktop && bun run tauri dev",
+    "build": "bun run gen && bun run driver:build && cd apps/desktop && bun run tauri build",
+    "spike": "drivers/WordDriver/bin/Debug/net48/WordDriver.exe"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.6.0",
+    "json-schema-to-typescript": "^15.0.0"
+  }
+}

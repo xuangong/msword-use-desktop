@@ -1,0 +1,37 @@
+# Node / Bun
+node_modules/
+dist/
+.vite/
+bun.lockb
+.tsbuildinfo
+
+# Tauri / Rust
+target/
+**/Cargo.lock
+apps/desktop/src-tauri/binaries/
+
+# .NET
+bin/
+obj/
+*.suo
+*.user
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Generated
+packages/rpc-schema/src/methods.ts
+
+# Secrets
+.env
+.env.local
+
+# Word lock files
+~$*.docx
+~$*.doc
+
+# Local Claude config
+.claude/

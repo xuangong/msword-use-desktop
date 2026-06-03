@@ -1,0 +1,145 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "WordDriver RPC methods",
+  "description": "Single source of truth for the JSON-RPC contract between the Bun agent and the .NET 4.8 Word COM driver. Consumed by both: C# validates incoming params; TypeScript generates Params/Result type maps.",
+  "type": "object",
+  "properties": {
+    "methods": {
+      "type": "object",
+      "properties": {
+        "ping": {
+          "description": "Liveness probe. Returns {pong: true}.",
+          "params": { "type": "object", "properties": {}, "additionalProperties": false },
+          "result": {
+            "type": "object",
+            "required": ["pong"],
+            "properties": { "pong": { "const": true } }
+          }
+        },
+
+        "attach": {
+          "description": "Attach to a running Word.Application via Marshal.GetActiveObject. Returns version + docs open.",
+          "params": { "type": "object", "properties": {}, "additionalProperties": false },
+          "result": {
+            "type": "object",
+            "required": ["attached", "version", "documents"],
+            "properties": {
+              "attached": { "type": "boolean" },
+              "version": { "type": "string" },
+              "documents": { "type": "integer" },
+              "activeDoc": { "type": ["string", "null"] }
+            }
+          }
+        },
+
+        "observe.selection": {
+          "description": "Snapshot the current selection / cursor state.",
+          "params": { "type": "object", "properties": {}, "additionalProperties": false },
+          "result": {
+            "type": "object",
+            "required": ["text", "start", "end", "isEmpty"],
+            "properties": {
+              "text": { "type": "string" },
+              "start": { "type": "integer" },
+              "end": { "type": "integer" },
+              "isEmpty": { "type": "boolean" },
+              "paragraphIndex": { "type": ["integer", "null"] },
+              "page": { "type": ["integer", "null"] }
+            }
+          }
+        },
+
+        "observe.outline": {
+          "description": "Read heading-level paragraphs as a flat outline list. Capped at 200 nodes.",
+          "params": {
+            "type": "object",
+            "properties": {
+              "maxLevel": { "type": "integer", "minimum": 1, "maximum": 9, "default": 3 }
+            },
+            "additionalProperties": false
+          },
+          "result": {
+            "type": "object",
+            "required": ["total", "outline", "truncated"],
+            "properties": {
+              "total": { "type": "integer" },
+              "truncated": { "type": "boolean" },
+              "outline": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["level", "text", "start"],
+                  "properties": {
+                    "level": { "type": "integer" },
+                    "text": { "type": "string" },
+                    "start": { "type": "integer" }
+                  }
+                }
+              }
+            }
+          }
+        },
+
+        "polish.replaceRange": {
+          "description": "Replace the text of a range with new content, wrapped in TrackRevisions so it shows up as a tracked edit. Either bookmark or (start,end) or paragraphIndex must be provided.",
+          "params": {
+            "type": "object",
+            "properties": {
+              "newText": { "type": "string" },
+              "bookmark": { "type": ["string", "null"] },
+              "start": { "type": ["integer", "null"] },
+              "end": { "type": ["integer", "null"] },
+              "paragraphIndex": { "type": ["integer", "null"] },
+              "action": { "type": "string", "default": "polish:replace" },
+              "track": { "type": "boolean", "default": true }
+            },
+            "required": ["newText"],
+            "additionalProperties": false
+          },
+          "result": {
+            "type": "object",
+            "required": ["replacedChars", "newChars"],
+            "properties": {
+              "replacedChars": { "type": "integer" },
+              "newChars": { "type": "integer" },
+              "rangeStart": { "type": "integer" },
+              "rangeEnd": { "type": "integer" }
+            }
+          }
+        },
+
+        "polish.addComment": {
+          "description": "Attach a comment to a range. Used to tag AI edits with [AI: <action>].",
+          "params": {
+            "type": "object",
+            "properties": {
+              "text": { "type": "string" },
+              "bookmark": { "type": ["string", "null"] },
+              "start": { "type": ["integer", "null"] },
+              "end": { "type": ["integer", "null"] },
+              "paragraphIndex": { "type": ["integer", "null"] },
+              "author": { "type": "string", "default": "msword-use AI" }
+            },
+            "required": ["text"],
+            "additionalProperties": false
+          },
+          "result": {
+            "type": "object",
+            "required": ["commentIndex"],
+            "properties": {
+              "commentIndex": { "type": "integer" },
+              "scope": { "type": "string" }
+            }
+          }
+        },
+
+        "shutdown": {
+          "description": "Terminate the driver process cleanly. Returns immediately; the process exits right after.",
+          "params": { "type": "object", "properties": {}, "additionalProperties": false },
+          "result": { "type": "object", "properties": { "bye": { "const": true } } }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
