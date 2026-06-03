@@ -9,6 +9,7 @@
 import type { Supervisor } from "../../rpc/supervisor";
 import { completeMessage } from "../../llm/anthropic";
 import { POLISH_PRESETS, polishSystemPrompt, polishUserMessage, type PolishPreset } from "../prompts";
+import { friendlyDriverError } from "../errors";
 import type { ToolSpec } from "../../llm/anthropic";
 
 export const polishTextSpec: ToolSpec = {
@@ -98,8 +99,18 @@ export async function runPolish(
   let paragraphIndex: number | null = null;
 
   if (target === "selection") {
-    const sel = await supervisor.call("observe.selection");
-    if (sel.isEmpty) return polishError(style, "selection is empty — select text first");
+    let sel;
+    try {
+      sel = await supervisor.call("observe.selection");
+    } catch (err: any) {
+      return polishError(style, friendlyDriverError(err));
+    }
+    if (sel.isEmpty) {
+      return polishError(
+        style,
+        "当前没有选中文字。请在 Word 中先用鼠标选中要改写的段落，再发指令。",
+      );
+    }
     originalText = sel.text;
     paragraphIndex = sel.paragraphIndex ?? null;
     const start = sel.start;
@@ -115,21 +126,21 @@ export async function runPolish(
     commentRange = { start, end };
   } else {
     if (input.paragraph_index == null) {
-      return polishError(style, "paragraph target requires paragraph_index");
+      return polishError(style, "段落模式需要 paragraph_index 参数。");
     }
     paragraphIndex = input.paragraph_index;
-    // We don't have an observe.paragraph yet — fetch outline as a workaround
-    // OR just read it via direct paragraph slot in replaceRange (we have only
-    // paragraphIndex). For alpha we'll call observe.outline only to read the
-    // paragraph's text, which is wasteful but correct. TODO: add observe.paragraph.
-    const outline = await supervisor.call("observe.outline", { maxLevel: 9 } as any);
-    // outline only carries headings — for body paragraphs we can't read text
-    // without a new observe method. For alpha, send original=null and let LLM
-    // operate without context (degraded), or refuse:
-    return polishError(
-      style,
-      "target='paragraph' needs observe.paragraph (not implemented in alpha) — please use 'selection'",
-    );
+    let para;
+    try {
+      para = await supervisor.call("observe.paragraph", { index: paragraphIndex } as any);
+    } catch (err: any) {
+      return polishError(style, friendlyDriverError(err));
+    }
+    originalText = para.text;
+    commentRange = {
+      start: para.start,
+      end: para.end,
+      paragraphIndex,
+    };
   }
 
   // 2. Build LLM prompt + call.
@@ -143,27 +154,37 @@ export async function runPolish(
     // context_before/after omitted in alpha (would need extra observe calls)
   });
 
-  const llmResult = await completeMessage({
-    system,
-    messages: [{ role: "user", content: userMsg }],
-    cacheSystem: true,
-  });
+  let llmResult;
+  try {
+    llmResult = await completeMessage({
+      system,
+      messages: [{ role: "user", content: userMsg }],
+      cacheSystem: true,
+    });
+  } catch (err: any) {
+    return polishError(style, friendlyDriverError(err));
+  }
   const newText = llmResult.text.trim();
-  if (!newText) return polishError(style, "LLM returned empty rewrite");
+  if (!newText) return polishError(style, "LLM 返回了空内容，请重试。");
 
   // 3. Preserve trailing paragraph mark if the original had one.
   const trailing = originalText.endsWith("\r") ? "\r" : "";
   const finalText = newText + trailing;
 
   // 4. Write back via driver (Track Changes wrapper is inside the C# method).
-  const replaceResult = await supervisor.call("polish.replaceRange", {
-    newText: finalText,
-    start: commentRange.start,
-    end: commentRange.end,
-    paragraphIndex: commentRange.paragraphIndex,
-    action: `polish:${style}`,
-    track: true,
-  } as any);
+  let replaceResult;
+  try {
+    replaceResult = await supervisor.call("polish.replaceRange", {
+      newText: finalText,
+      start: commentRange.start,
+      end: commentRange.end,
+      paragraphIndex: commentRange.paragraphIndex,
+      action: `polish:${style}`,
+      track: true,
+    } as any);
+  } catch (err: any) {
+    return polishError(style, friendlyDriverError(err));
+  }
 
   // 5. Tag the new range with an [AI: ...] comment so users can audit.
   // The replace mutates the range — new end is rangeStart + len(newText).

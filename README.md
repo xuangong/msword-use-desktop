@@ -1,11 +1,14 @@
 # msword-use-desktop
 
-> Windows-only. Microsoft Word + .NET Framework 4.8 + Node 20+/Bun 1.x + Rust 1.84+.
+> Windows-only. Requires Microsoft Word + .NET Framework 4.8 + Node 20+/Bun 1.x + Rust 1.84+.
 
-A desktop app that drives Microsoft Word via natural language. The full editing path
-runs through Word's Track Changes, so every AI edit is auditable and reviewable.
+A desktop app that drives Microsoft Word via natural language. Every AI edit
+flows through Word's Track Changes, so users can review and accept/reject
+just like a human collaborator's changes.
 
-This is the **v2 desktop product**, evolved from the [Python CLI / Claude Code plugin v1](https://github.com/xuangong/msword-use). v1 stays alive as the developer/debug edition.
+This is the **v2 desktop product**, evolved from the
+[Python CLI / Claude Code plugin v1](https://github.com/xuangong/msword-use).
+v1 stays alive as the developer/debug edition.
 
 ## Architecture
 
@@ -19,8 +22,8 @@ Tauri 2 (Rust)           (apps/desktop/src-tauri)
         │ NDJSON over stdio (sidecar)
         ▼
 Bun agent loop           (apps/agent)
-        ▲
-        │ NDJSON over stdio (subprocess + supervisor)
+        ▲ Anthropic SDK
+        │ NDJSON over stdio (supervised subprocess)
         ▼
 WordDriver.exe (.NET 4.8) (drivers/WordDriver)
         ▲
@@ -29,17 +32,15 @@ WordDriver.exe (.NET 4.8) (drivers/WordDriver)
 Microsoft Word
 ```
 
-Why .NET Framework 4.8 (not .NET 10): Microsoft has [explicitly stated](https://learn.microsoft.com/en-us/answers/questions/1685712/open-word-document-in-net) that the Office Interop / VSTO platform will not move to .NET Core / 5+.
+**Why .NET Framework 4.8 (not .NET 10):** Microsoft has
+[explicitly stated](https://learn.microsoft.com/en-us/answers/questions/1685712/open-word-document-in-net)
+that Office Interop / VSTO won't move to .NET Core / 5+. The spike confirmed
+this — net48 + `Microsoft.Office.Interop.Word` works; .NET 10 fails at
+runtime (`office.dll` cannot load).
 
-## Repo layout
-
-```
-apps/desktop/         Tauri shell + React UI
-apps/agent/           Bun sidecar (TS, agent loop, LLM client)
-drivers/WordDriver/   .NET 4.8 console exe (COM driver)
-packages/rpc-schema/  Generated TS types from drivers/WordDriver/schema/methods.json
-scripts/              build / dev / codegen scripts
-```
+**Why a supervised driver subprocess:** Word COM can hang (modal dialogs,
+runaway operations). The Bun supervisor detects 10-second hangs, kills the
+driver, and respawns it. Word itself keeps running — re-attach is automatic.
 
 ## Quick start (developer)
 
@@ -51,7 +52,7 @@ bun install                # install workspace deps
 bun run gen                # regenerate RPC types from drivers/WordDriver/schema/methods.json
 bun run driver:build       # build the .NET 4.8 Word COM driver
 
-# Export your Anthropic key (required for chat / polish)
+# Export your Anthropic key — required for chat / polish
 # PowerShell:
 $env:ANTHROPIC_API_KEY = "sk-ant-..."
 # bash:
@@ -60,30 +61,67 @@ export ANTHROPIC_API_KEY=sk-ant-...
 bun run dev                # launch Tauri dev (Vite + Rust + Bun sidecar + auto-spawned WordDriver)
 ```
 
-### Try it out
+## Using it
 
-Open Microsoft Word with any document. `bun run dev` opens the Tauri window.
+### 1. Open Word
+Open Microsoft Word with any document. For the best demo, use a Chinese
+document (we ship `gongwen_sample.docx` in the v1 repo as a fixture).
 
-**Chat mode (default — talks to the LLM agent):**
-- Select a paragraph in Word, then type "把这段改成公文风格" in the input box
-- You'll see a tool-call card (`polish_text({...})`) that you can expand to inspect
+### 2. Launch the app
+`bun run dev` opens the Tauri window. Within ~2 seconds the header should show
+`驱动 gen=1` in green and the right-side context panel should populate with
+the active document name, current selection, and outline.
+
+### 3. Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Space</kbd>
+Global hotkey — works from any app, including from Word itself. Toggles the
+msword-use window in/out of focus.
+
+### 4. Chat with the agent
+- Select a paragraph in Word
+- In the chat box, type 「**把这段改成公文风格**」 (or English: "Polish this in 公文 style")
+- Watch the tool-call card appear (you can expand it to inspect)
 - The assistant streams a Chinese summary
-- The change appears in Word as a tracked revision with an `[AI: polish:公文]` comment
+- In Word: the change appears as a **tracked revision** with an
+  `[AI: polish:公文]` comment
 
-**Raw RPC mode (prefix `/`, for debugging):**
+### 5. Raw RPC for debugging (`/` prefix)
 - `/ping` → `{pong: true}`
 - `/attach` → `{attached: true, version: "16.0", ...}`
 - `/observe.outline` → current document's heading tree
 - `/observe.selection` → current selection state
-- `/_freeze` → simulate a hang; after ~10s the supervisor kills + restarts; `gen` jumps to 2
+- `/observe.paragraph {"index":4}` → read paragraph 4
+- `/_freeze` → simulate a driver hang; ~10s later the supervisor
+  kills + restarts and `gen` jumps to 2
 
-### Headless smoke tests (no Tauri window)
+## Styles
+
+The `polish_text` tool accepts five built-in presets (ported from v1):
+
+| preset | use case |
+|---|---|
+| `公文` | Chinese government / institutional documents |
+| `合同` | Contracts and legal writing |
+| `论文` | Academic papers |
+| `文案` | Marketing copy |
+| `商务` | Business correspondence |
+| `custom` | Free-form style description (set via `custom_style`) |
+
+## Headless smoke tests (no Tauri window)
 
 ```bash
-bun run scripts/test-sidecar.ts   # raw RPC + hang+restart cycle (week 1)
-bun run scripts/test-chat.ts      # full agent loop with polish_text (week 2)
+bun run scripts/test-sidecar.ts   # raw RPC + hang/restart cycle (week 1)
+bun run scripts/test-chat.ts      # full agent loop with polish_text (week 2/3)
 ```
 
 ## Status
 
-Week 2 of 3 — alpha. End-to-end `/polish` over the agent loop validated headlessly. Tauri window verification is manual.
+**Alpha (Week 3 of 3 complete).** End-to-end `/polish` over the agent loop
+validated. Built-in observability (CoT stream, tool-call expand, Word
+context panel, supervisor gen tracking). Tauri window tested in dev mode;
+`bun run build` (.msi packaging) is wired up but not yet exercised in CI.
+
+### Known limitations (alpha)
+- `bun run dev` requires that `ANTHROPIC_API_KEY` is set in the launching shell
+- Inner sidecar binaries are not yet Authenticode-signed → SmartScreen warning on first run of a built .msi
+- Word must run unelevated (or both Word and the desktop app elevated together)
+- Comments on tracked insertions can fail silently in some Word versions — the edit still applies, just no `[AI:...]` comment

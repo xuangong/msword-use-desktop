@@ -55,5 +55,37 @@ namespace MswordUse.WordDriver.Methods
             }
             return new { total = doc.Paragraphs.Count, outline = outline, truncated = truncated };
         }
+
+        /// <summary>
+        /// Read a single paragraph by 1-based index. Returns its text +
+        /// position so the agent can polish it without an active selection.
+        /// </summary>
+        public static object Paragraph(int index)
+        {
+            var doc = WordSession.ActiveDoc();
+            if (index < 1 || index > doc.Paragraphs.Count)
+                throw new System.Exception("paragraph index out of range: " + index);
+            var p = doc.Paragraphs[index];
+            int lvl = (int)p.OutlineLevel;
+            var text = p.Range.Text ?? "";
+            string styleName = null;
+            try
+            {
+                var styleObj = p.Range.get_Style() as Word.Style;
+                if (styleObj != null) styleName = styleObj.NameLocal;
+            }
+            catch { /* style read may fail in some doc states; skip */ }
+            return new
+            {
+                index = index,
+                text = text,
+                trimmedText = text.Trim('\r', '\n', '\x07', ' ', '\t'),
+                start = p.Range.Start,
+                end = p.Range.End,
+                outlineLevel = lvl,
+                isHeading = lvl < 10,
+                styleName = styleName,
+            };
+        }
     }
 }

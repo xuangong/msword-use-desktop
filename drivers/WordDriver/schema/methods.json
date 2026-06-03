@@ -80,6 +80,32 @@
           }
         },
 
+        "observe.paragraph": {
+          "description": "Read a single paragraph (1-based index) — text, position, outline level, style name. Used by tools that target a specific paragraph instead of the current selection.",
+          "params": {
+            "type": "object",
+            "properties": {
+              "index": { "type": "integer", "minimum": 1 }
+            },
+            "required": ["index"],
+            "additionalProperties": false
+          },
+          "result": {
+            "type": "object",
+            "required": ["index", "text", "trimmedText", "start", "end", "outlineLevel", "isHeading"],
+            "properties": {
+              "index": { "type": "integer" },
+              "text": { "type": "string" },
+              "trimmedText": { "type": "string" },
+              "start": { "type": "integer" },
+              "end": { "type": "integer" },
+              "outlineLevel": { "type": "integer" },
+              "isHeading": { "type": "boolean" },
+              "styleName": { "type": ["string", "null"] }
+            }
+          }
+        },
+
         "polish.replaceRange": {
           "description": "Replace the text of a range with new content, wrapped in TrackRevisions so it shows up as a tracked edit. Either bookmark or (start,end) or paragraphIndex must be provided.",
           "params": {

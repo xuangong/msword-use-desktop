@@ -23,6 +23,9 @@ const driverExe = process.env.MSWORD_DRIVER_EXE
   ?? resolve(import.meta.dir, "../../../drivers/WordDriver/bin/Debug/net48/WordDriver.exe");
 
 const supervisor = new Supervisor({ exePath: driverExe, callTimeoutMs: 10_000 });
+supervisor.onGenChange = (info) => {
+  write({ kind: "driver_restart", from: info.from, to: info.to, reason: info.reason });
+};
 
 function write(obj: unknown) {
   process.stdout.write(JSON.stringify(obj) + "\n");

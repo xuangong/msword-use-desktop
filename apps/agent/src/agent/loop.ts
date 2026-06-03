@@ -15,6 +15,7 @@
 import { streamMessage, type MessageInput, type ToolSpec } from "../llm/anthropic";
 import type { Supervisor } from "../rpc/supervisor";
 import { polishTextSpec, runPolish, type PolishToolInput } from "./tools/polishText";
+import { friendlyDriverError } from "./errors";
 
 const SYSTEM_PROMPT = `你是 msword-use 桌面应用的 AI 助手，专门帮助用户操作 Microsoft Word 文档。
 
@@ -81,7 +82,7 @@ export async function* runAgentTurn(
         }
       }
     } catch (err: any) {
-      yield { kind: "error", error: String(err?.message ?? err) };
+      yield { kind: "error", error: friendlyDriverError(err) };
       return;
     }
 

@@ -78,11 +78,16 @@ export class Supervisor {
   }
 
   async restart() {
+    const oldGen = this.gen;
     this.client.kill();
     await this.client.exited();
     this.gen++;
     this.client = new DriverClient(this.opts);
+    this.onGenChange?.({ from: oldGen, to: this.gen, reason: "hang" });
   }
+
+  /** Caller can hook into generation changes to surface restart events to the UI. */
+  onGenChange?: (info: { from: number; to: number; reason: string }) => void;
 
   async shutdown() {
     try {

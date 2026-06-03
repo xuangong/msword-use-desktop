@@ -74,6 +74,8 @@ namespace MswordUse.WordDriver
                     return Methods.Observe.Selection();
                 case "observe.outline":
                     return Methods.Observe.Outline(p["maxLevel"]?.ToObject<int?>() ?? 3);
+                case "observe.paragraph":
+                    return Methods.Observe.Paragraph(p["index"].ToObject<int>());
 
                 case "polish.replaceRange":
                     return Methods.Polish.ReplaceRange(p);

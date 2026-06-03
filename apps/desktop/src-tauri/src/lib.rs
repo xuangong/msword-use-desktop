@@ -13,7 +13,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 static SIDECAR_STDIN: OnceCell<Mutex<ChildStdin>> = OnceCell::new();
 
@@ -106,13 +107,37 @@ fn spawn_sidecar(app: &AppHandle) -> Result<Child, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let toggle_shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Space);
+
     tauri::Builder::default()
-        .setup(|app| {
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(move |app, shortcut, event| {
+                    if shortcut == &toggle_shortcut && event.state() == ShortcutState::Pressed {
+                        if let Some(w) = app.get_webview_window("main") {
+                            // Toggle: hide if focused, show + focus otherwise.
+                            let is_visible = w.is_visible().unwrap_or(false);
+                            let is_focused = w.is_focused().unwrap_or(false);
+                            if is_visible && is_focused {
+                                let _ = w.hide();
+                            } else {
+                                let _ = w.unminimize();
+                                let _ = w.show();
+                                let _ = w.set_focus();
+                            }
+                        }
+                    }
+                })
+                .build(),
+        )
+        .setup(move |app| {
+            // Register the global shortcut now that the plugin is initialised.
+            if let Err(e) = app.global_shortcut().register(toggle_shortcut) {
+                eprintln!("[main] failed to register global shortcut: {}", e);
+            }
+
             let handle = app.handle().clone();
-            // Spawn sidecar shortly after the app starts; if it fails, surface
-            // the error to the UI as a `bun:log` event rather than crashing.
             tauri::async_runtime::spawn(async move {
-                // Brief delay so the UI is up to receive events.
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 match spawn_sidecar(&handle) {
                     Ok(_child) => {
