@@ -9,7 +9,6 @@
 //   we read:   {"id":"<str>","result":...,"error":...,"gen":N}
 
 use once_cell::sync::OnceCell;
-use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Mutex;
@@ -23,24 +22,12 @@ async fn bun_send(
     app: AppHandle,
     line: String,
 ) -> Result<String, String> {
-    // The UI sends a bare command like "ping" or full JSON. Wrap bare ones.
-    let trimmed = line.trim();
-    let request = if trimmed.starts_with('{') {
-        trimmed.to_string()
-    } else {
-        // Parse as "<method> [json-args]" — alpha convenience.
-        let mut parts = trimmed.splitn(2, ' ');
-        let method = parts.next().unwrap_or("").to_string();
-        let params_str = parts.next().unwrap_or("{}");
-        let params: Value = serde_json::from_str(params_str)
-            .unwrap_or_else(|_| json!({}));
-        let req = json!({
-            "id": format!("{}", chrono_ish()),
-            "method": method,
-            "params": params,
-        });
-        req.to_string()
-    };
+    // Caller passes a complete JSON line. The UI is responsible for shape
+    // (either {kind:"chat",id,message} or {id,method,params}).
+    let request = line.trim().to_string();
+    if !request.starts_with('{') {
+        return Err("bun_send expects a JSON object (the UI must wrap it)".into());
+    }
 
     let stdin_mutex = SIDECAR_STDIN.get().ok_or("sidecar not initialized")?;
     {
@@ -48,18 +35,11 @@ async fn bun_send(
         writeln!(stdin, "{}", request).map_err(|e| e.to_string())?;
         stdin.flush().map_err(|e| e.to_string())?;
     }
-    // Replies arrive asynchronously via the `bun:reply` event; the caller
-    // just gets an ack here. (Synchronous response correlation is a v2 nicety.)
     let _ = app.emit("bun:sent", &request);
-    Ok(format!("sent: {}", request))
+    Ok("ok".into())
 }
 
-fn chrono_ish() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
-}
+fn _legacy_chrono_unused() {}
 
 fn spawn_sidecar(app: &AppHandle) -> Result<Child, String> {
     // Dev path: bun runs the TS directly. Production path will swap to the

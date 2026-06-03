@@ -1,30 +1,28 @@
 /**
  * Bun sidecar entry point.
  *
- * Listens on stdin (NDJSON, fed by Tauri). Forwards typed RPC calls to the
- * WordDriver subprocess via Supervisor. Writes responses to stdout.
+ * Receives NDJSON requests from Tauri on stdin, dispatches to one of:
  *
- * Wire format (from Tauri):
- *   {"id":"<str>","method":"<str>","params":{...}}
+ *   {"kind":"raw","id":"<str>","method":"<str>","params":{...}}
+ *     — pass-through RPC into the WordDriver. Used by the dev UI's
+ *       "raw command" mode and by the test harness.
  *
- * Wire format (to Tauri):
- *   {"id":"<str>","result":{...},"error":null}
- *   {"id":"<str>","error":"<msg>"}
+ *   {"kind":"chat","id":"<str>","message":"<str>"}
+ *     — runs one agent turn; streams events back as
+ *       {"id":"<str>","kind":"agent_event","event":{...}}
  *
- * Today this is a thin pass-through — week 2 adds the agent loop here.
- * Inputs starting with `_` are dev escape hatches (e.g. _freeze).
+ * Old-style requests without `kind` are treated as `raw` for backwards compat
+ * with the W1 test harness.
  */
 
 import { Supervisor } from "./rpc/supervisor";
+import { runAgentTurn } from "./agent/loop";
 import { resolve } from "node:path";
 
-// In dev, point at the dotnet build output. In production this exe is bundled
-// next to the Bun sidecar via the Tauri externalBin mechanism, so use a
-// path-relative-to-self lookup.
 const driverExe = process.env.MSWORD_DRIVER_EXE
   ?? resolve(import.meta.dir, "../../../drivers/WordDriver/bin/Debug/net48/WordDriver.exe");
 
-const supervisor = new Supervisor({ exePath: driverExe, callTimeoutMs: 5000 });
+const supervisor = new Supervisor({ exePath: driverExe, callTimeoutMs: 10_000 });
 
 function write(obj: unknown) {
   process.stdout.write(JSON.stringify(obj) + "\n");
@@ -43,29 +41,55 @@ for await (const chunk of Bun.stdin.stream()) {
     const line = buf.slice(0, nl).trim();
     buf = buf.slice(nl + 1);
     if (!line) continue;
+    // Fire-and-forget — async handler emits its own replies.
     handleLine(line);
   }
 }
 
 async function handleLine(line: string) {
-  let req: { id?: string; method?: string; params?: unknown };
+  let req: any;
   try { req = JSON.parse(line); }
   catch (err) {
     write({ id: null, error: `parse_error: ${err}` });
     return;
   }
 
-  if (!req.method) {
-    write({ id: req.id ?? null, error: "missing method" });
+  const id = req.id ?? null;
+
+  // chat mode: run an agent turn, stream events
+  if (req.kind === "chat") {
+    const message = req.message;
+    if (typeof message !== "string") {
+      write({ id, kind: "agent_event", event: { kind: "error", error: "missing message" } });
+      return;
+    }
+    try {
+      for await (const ev of runAgentTurn(message, supervisor)) {
+        write({ id, kind: "agent_event", event: ev, gen: supervisor.generation });
+      }
+    } catch (err: any) {
+      write({
+        id,
+        kind: "agent_event",
+        event: { kind: "error", error: String(err?.message ?? err) },
+        gen: supervisor.generation,
+      });
+    }
     return;
   }
 
+  // raw mode (default): pass-through into the driver
+  const method = req.method;
+  if (typeof method !== "string") {
+    write({ id, error: "missing method" });
+    return;
+  }
   try {
-    const result = req.method.startsWith("_")
-      ? await supervisor.callRaw(req.method, req.params)
-      : await supervisor.call(req.method as any, req.params as any);
-    write({ id: req.id ?? null, result, error: null, gen: supervisor.generation });
+    const result = method.startsWith("_")
+      ? await supervisor.callRaw(method, req.params)
+      : await supervisor.call(method, req.params);
+    write({ id, result, error: null, gen: supervisor.generation });
   } catch (err: any) {
-    write({ id: req.id ?? null, result: null, error: String(err?.message ?? err), gen: supervisor.generation });
+    write({ id, result: null, error: String(err?.message ?? err), gen: supervisor.generation });
   }
 }

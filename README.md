@@ -50,26 +50,40 @@ cd msword-use-desktop
 bun install                # install workspace deps
 bun run gen                # regenerate RPC types from drivers/WordDriver/schema/methods.json
 bun run driver:build       # build the .NET 4.8 Word COM driver
+
+# Export your Anthropic key (required for chat / polish)
+# PowerShell:
+$env:ANTHROPIC_API_KEY = "sk-ant-..."
+# bash:
+export ANTHROPIC_API_KEY=sk-ant-...
+
 bun run dev                # launch Tauri dev (Vite + Rust + Bun sidecar + auto-spawned WordDriver)
 ```
 
 ### Try it out
 
-1. Open Microsoft Word with any document
-2. `bun run dev` — the Tauri window appears
-3. Type commands in the input box and hit enter:
-   - `ping` → `{pong: true}`
-   - `attach` → `{attached: true, version: "16.0", ...}`
-   - `observe.outline` → current document's heading tree
-   - `observe.selection` → current selection state
-   - `_freeze` → simulate a hang; after 5s the supervisor kills + restarts; `gen` jumps to 2
+Open Microsoft Word with any document. `bun run dev` opens the Tauri window.
 
-### Headless smoke test (no Tauri window)
+**Chat mode (default — talks to the LLM agent):**
+- Select a paragraph in Word, then type "把这段改成公文风格" in the input box
+- You'll see a tool-call card (`polish_text({...})`) that you can expand to inspect
+- The assistant streams a Chinese summary
+- The change appears in Word as a tracked revision with an `[AI: polish:公文]` comment
+
+**Raw RPC mode (prefix `/`, for debugging):**
+- `/ping` → `{pong: true}`
+- `/attach` → `{attached: true, version: "16.0", ...}`
+- `/observe.outline` → current document's heading tree
+- `/observe.selection` → current selection state
+- `/_freeze` → simulate a hang; after ~10s the supervisor kills + restarts; `gen` jumps to 2
+
+### Headless smoke tests (no Tauri window)
 
 ```bash
-bun run driver:test        # spawns Bun sidecar + .NET driver, runs full hang+restart cycle
+bun run scripts/test-sidecar.ts   # raw RPC + hang+restart cycle (week 1)
+bun run scripts/test-chat.ts      # full agent loop with polish_text (week 2)
 ```
 
 ## Status
 
-Alpha (Week 1 of 3). See `apps/agent/src/index.ts` for the current entry behavior.
+Week 2 of 3 — alpha. End-to-end `/polish` over the agent loop validated headlessly. Tauri window verification is manual.
