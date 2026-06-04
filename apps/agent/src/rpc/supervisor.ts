@@ -9,27 +9,41 @@
 import { DriverClient, DriverError, type DriverClientOptions } from "./driverClient";
 import type { MethodName, Params, Result } from "@msword/rpc-schema";
 
+/**
+ * Minimal DriverClient surface the Supervisor uses. Real DriverClient
+ * satisfies this; tests pass a mock to avoid spawning a real driver.
+ */
+export interface DriverClientLike {
+  call<M extends MethodName>(method: M, params?: Params<M>): Promise<Result<M>>;
+  callRaw(method: string, params?: unknown): Promise<unknown>;
+  kill(): void;
+  exited(): Promise<number>;
+}
+
 export interface SupervisorOptions extends DriverClientOptions {
   /** ms before a single call is considered hung. */
   callTimeoutMs?: number;
   /** Max restarts per minute before we give up. */
   maxRestartsPerMin?: number;
+  /** Test seam: override how new driver clients are constructed. */
+  factory?: (opts: DriverClientOptions) => DriverClientLike;
 }
 
 export class Supervisor {
-  private client: DriverClient;
+  private client: DriverClientLike;
   private gen = 1;
   private restartHistory: number[] = [];
-  private readonly opts: Required<SupervisorOptions>;
+  private readonly opts: Required<Omit<SupervisorOptions, "factory">> & { factory: NonNullable<SupervisorOptions["factory"]> };
 
   constructor(opts: SupervisorOptions) {
     this.opts = {
       args: [],
       callTimeoutMs: 5000,
       maxRestartsPerMin: 3,
+      factory: (o) => new DriverClient(o),
       ...opts,
-    };
-    this.client = new DriverClient(this.opts);
+    } as any;
+    this.client = this.opts.factory(this.opts);
   }
 
   get generation(): number {
@@ -49,10 +63,21 @@ export class Supervisor {
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => reject(new HangError(method)), this.opts.callTimeoutMs);
     });
+    const work = fn();
+    // P1: if the timeout wins, the in-flight work() promise will still
+    // resolve/reject later (when client.kill→exited→pending callback fires).
+    // Swallow that delayed rejection so it doesn't become an
+    // unhandledRejection — the supervisor already turned the hang into a
+    // HangError for the caller.
+    work.catch(() => {});
     try {
-      return await Promise.race([fn(), timeout]);
+      return await Promise.race([work, timeout]);
     } catch (err) {
       if (err instanceof HangError) {
+        // Kill the driver immediately so the in-flight `work` resolves with
+        // "driver exited" rather than continuing to take time before the
+        // user sees the failure. handleHang then respawns with throttling.
+        this.client.kill();
         await this.handleHang();
       }
       throw err;
@@ -79,10 +104,13 @@ export class Supervisor {
 
   async restart() {
     const oldGen = this.gen;
+    // client.kill() is idempotent; runWithTimeout already called it for the
+    // hang path, but explicit restart() callers (tests, manual recovery) rely
+    // on us doing it here.
     this.client.kill();
     await this.client.exited();
     this.gen++;
-    this.client = new DriverClient(this.opts);
+    this.client = this.opts.factory(this.opts);
     this.onGenChange?.({ from: oldGen, to: this.gen, reason: "hang" });
   }
 

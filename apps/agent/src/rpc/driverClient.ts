@@ -10,6 +10,7 @@
  */
 
 import type { MethodName, Params, Result, RpcResponse } from "@msword/rpc-schema";
+import { NdjsonSplitter } from "./ndjson";
 
 export interface DriverClientOptions {
   exePath: string;
@@ -28,7 +29,6 @@ export class DriverClient {
   readonly proc: Bun.Subprocess<"pipe", "pipe", "pipe">;
   private nextId = 1;
   private pending = new Map<string, (line: string) => void>();
-  private buf = "";
   private closed = false;
   private exitPromise: Promise<number>;
 
@@ -55,16 +55,11 @@ export class DriverClient {
 
   private async pump() {
     const reader = this.proc.stdout.getReader();
-    const decoder = new TextDecoder("utf-8");
+    const splitter = new NdjsonSplitter();
     while (true) {
       const { value, done } = await reader.read();
       if (done) return;
-      this.buf += decoder.decode(value, { stream: true });
-      let nl: number;
-      while ((nl = this.buf.indexOf("\n")) >= 0) {
-        const line = this.buf.slice(0, nl).trim();
-        this.buf = this.buf.slice(nl + 1);
-        if (!line) continue;
+      for (const line of splitter.push(value)) {
         let parsed: RpcResponse;
         try { parsed = JSON.parse(line); }
         catch { continue; }

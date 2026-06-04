@@ -13,6 +13,12 @@
  *
  * Old-style requests without `kind` are treated as `raw` for backwards compat
  * with the W1 test harness.
+ *
+ * Concurrency:
+ * - chat requests are SERIALIZED through a single FIFO queue. Two near-
+ *   simultaneous chat messages would otherwise race on the same Word selection
+ *   (e.g. user clicks "send" twice). Raw RPCs stay parallel — they're
+ *   independent driver calls.
  */
 
 import { Supervisor } from "./rpc/supervisor";
@@ -33,6 +39,17 @@ function write(obj: unknown) {
 
 write({ ready: true, driverExe, gen: supervisor.generation });
 
+// Serial chat queue. Each entry runs to completion (all events streamed)
+// before the next starts. Implemented as a promise chain.
+let chatChain: Promise<void> = Promise.resolve();
+
+function enqueueChat(fn: () => Promise<void>): Promise<void> {
+  // Catch errors so a thrown chat doesn't poison the chain for subsequent ones.
+  const next = chatChain.then(fn, fn);
+  chatChain = next.catch(() => {});
+  return next;
+}
+
 // Read NDJSON from stdin.
 let buf = "";
 const decoder = new TextDecoder("utf-8");
@@ -49,7 +66,7 @@ for await (const chunk of Bun.stdin.stream()) {
   }
 }
 
-async function handleLine(line: string) {
+function handleLine(line: string) {
   let req: any;
   try { req = JSON.parse(line); }
   catch (err) {
@@ -59,29 +76,36 @@ async function handleLine(line: string) {
 
   const id = req.id ?? null;
 
-  // chat mode: run an agent turn, stream events
+  // chat mode: run an agent turn, stream events.
+  // Serialized: queued behind any in-flight chat.
   if (req.kind === "chat") {
     const message = req.message;
     if (typeof message !== "string") {
       write({ id, kind: "agent_event", event: { kind: "error", error: "missing message" } });
       return;
     }
-    try {
-      for await (const ev of runAgentTurn(message, supervisor)) {
-        write({ id, kind: "agent_event", event: ev, gen: supervisor.generation });
+    enqueueChat(async () => {
+      try {
+        for await (const ev of runAgentTurn(message, supervisor)) {
+          write({ id, kind: "agent_event", event: ev, gen: supervisor.generation });
+        }
+      } catch (err: any) {
+        write({
+          id,
+          kind: "agent_event",
+          event: { kind: "error", error: String(err?.message ?? err) },
+          gen: supervisor.generation,
+        });
       }
-    } catch (err: any) {
-      write({
-        id,
-        kind: "agent_event",
-        event: { kind: "error", error: String(err?.message ?? err) },
-        gen: supervisor.generation,
-      });
-    }
+    });
     return;
   }
 
-  // raw mode (default): pass-through into the driver
+  // raw mode (default): pass-through into the driver, executed concurrently.
+  void handleRaw(id, req);
+}
+
+async function handleRaw(id: string | null, req: any) {
   const method = req.method;
   if (typeof method !== "string") {
     write({ id, error: "missing method" });

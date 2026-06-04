@@ -70,7 +70,15 @@ export interface PolishToolResult {
   error?: string;
 }
 
-const CONTEXT_CHARS = 200;
+/**
+ * The exact range descriptor we'll pass to polish.replaceRange and later to
+ * polish.addComment. Exactly one of {bookmark, paragraphIndex, (start,end)}
+ * should be filled. The C# resolver in Polish.cs prefers bookmark > paragraphIndex
+ * > start/end, so we never set start/end alongside paragraphIndex.
+ */
+type TargetRange =
+  | { kind: "range"; start: number; end: number }
+  | { kind: "paragraph"; paragraphIndex: number };
 
 /**
  * Execute polish: resolve target → call LLM → write back through driver.
@@ -94,8 +102,7 @@ export async function runPolish(
 
   // 1. Resolve the target range.
   let originalText: string;
-  let writeBack: () => Promise<{ replacedChars: number; newChars: number; rangeStart: number; rangeEnd: number }>;
-  let commentRange: { paragraphIndex?: number; start?: number; end?: number };
+  let targetRange: TargetRange;
   let paragraphIndex: number | null = null;
 
   if (target === "selection") {
@@ -113,17 +120,7 @@ export async function runPolish(
     }
     originalText = sel.text;
     paragraphIndex = sel.paragraphIndex ?? null;
-    const start = sel.start;
-    const end = sel.end;
-    writeBack = () =>
-      supervisor.call("polish.replaceRange", {
-        newText: "<placeholder>",
-        start,
-        end,
-        action: `polish:${style}`,
-        track: true,
-      } as any);
-    commentRange = { start, end };
+    targetRange = { kind: "range", start: sel.start, end: sel.end };
   } else {
     if (input.paragraph_index == null) {
       return polishError(style, "段落模式需要 paragraph_index 参数。");
@@ -136,11 +133,7 @@ export async function runPolish(
       return polishError(style, friendlyDriverError(err));
     }
     originalText = para.text;
-    commentRange = {
-      start: para.start,
-      end: para.end,
-      paragraphIndex,
-    };
+    targetRange = { kind: "paragraph", paragraphIndex };
   }
 
   // 2. Build LLM prompt + call.
@@ -171,34 +164,38 @@ export async function runPolish(
   const trailing = originalText.endsWith("\r") ? "\r" : "";
   const finalText = newText + trailing;
 
-  // 4. Write back via driver (Track Changes wrapper is inside the C# method).
+  // 4. Write back via driver. The C# RevisionScope wraps this with TrackRevisions
+  // so the edit shows up as a tracked revision. The driver returns the actual
+  // post-mutation rangeStart/rangeEnd, which we use for the comment range
+  // (string-length math doesn't work because Word positions count paragraph marks
+  // and visible-revision overlays differently from JS .length).
+  const replaceParams = {
+    newText: finalText,
+    action: `polish:${style}`,
+    track: true,
+    ...rangeToParams(targetRange),
+  } as any;
+
   let replaceResult;
   try {
-    replaceResult = await supervisor.call("polish.replaceRange", {
-      newText: finalText,
-      start: commentRange.start,
-      end: commentRange.end,
-      paragraphIndex: commentRange.paragraphIndex,
-      action: `polish:${style}`,
-      track: true,
-    } as any);
+    replaceResult = await supervisor.call("polish.replaceRange", replaceParams);
   } catch (err: any) {
     return polishError(style, friendlyDriverError(err));
   }
 
   // 5. Tag the new range with an [AI: ...] comment so users can audit.
-  // The replace mutates the range — new end is rangeStart + len(newText).
+  // Use the driver-reported rangeEnd directly (P0-6: don't compute from JS length).
   let commentIndex: number | undefined;
   try {
     const c = await supervisor.call("polish.addComment", {
       text: `[AI: polish:${style}] ${input.extra_instruction ?? ""}`.trim(),
       start: replaceResult.rangeStart,
-      end: replaceResult.rangeStart + finalText.length,
+      end: replaceResult.rangeEnd,
     } as any);
     commentIndex = c.commentIndex;
   } catch (err) {
     // Comment failure shouldn't roll back the edit — Word may not support
-    // a comment on the resulting range (e.g. it became a tracked-insertion).
+    // a comment on a tracked-insertion range in some versions/states.
     console.error("[polish] addComment failed (non-fatal):", err);
   }
 
@@ -212,6 +209,13 @@ export async function runPolish(
     paragraph_index: paragraphIndex,
     comment_index: commentIndex,
   };
+}
+
+/** Convert a TargetRange into the params the C# resolver expects. */
+function rangeToParams(r: TargetRange): Record<string, unknown> {
+  return r.kind === "range"
+    ? { start: r.start, end: r.end }
+    : { paragraphIndex: r.paragraphIndex };
 }
 
 function polishError(style: string, msg: string): PolishToolResult {

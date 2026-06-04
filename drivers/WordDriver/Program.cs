@@ -51,6 +51,14 @@ namespace MswordUse.WordDriver
                 {
                     WriteResponse(id, null, ex.GetType().Name + ": " + ex.Message);
                 }
+
+                // P0-12: shutdown writes its response above via the normal
+                // path, then exits AFTER the write completes. The previous
+                // version wrote twice (once in Dispatch, once here).
+                if (method == "shutdown")
+                {
+                    return 0;
+                }
             }
             return 0;
         }
@@ -83,12 +91,9 @@ namespace MswordUse.WordDriver
                     return Methods.Polish.AddComment(p);
 
                 case "shutdown":
-                    // Schedule exit after we write the response.
-                    AppDomain.CurrentDomain.ProcessExit += (_, __) => { };
-                    var bye = new { bye = true };
-                    WriteResponse(null, bye, null);
-                    Environment.Exit(0);
-                    return bye;
+                    // Return cleanly; the main loop writes our response then
+                    // exits the while-loop because of method == "shutdown".
+                    return new { bye = true };
 
                 default:
                     throw new Exception("unknown method: " + method);
