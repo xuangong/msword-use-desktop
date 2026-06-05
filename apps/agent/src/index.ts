@@ -23,6 +23,7 @@
 
 import { Supervisor } from "./rpc/supervisor";
 import { runAgentTurn } from "./agent/loop";
+import { friendlyDriverError } from "./agent/errors";
 import { resolve } from "node:path";
 
 const driverExe = process.env.MSWORD_DRIVER_EXE
@@ -86,7 +87,7 @@ function handleLine(line: string) {
     }
     enqueueChat(async () => {
       try {
-        for await (const ev of runAgentTurn(message, supervisor)) {
+        for await (const ev of runAgentTurn(message, supervisor, req.target)) {
           write({ id, kind: "agent_event", event: ev, gen: supervisor.generation });
         }
       } catch (err: any) {
@@ -117,6 +118,6 @@ async function handleRaw(id: string | null, req: any) {
       : await supervisor.call(method, req.params);
     write({ id, result, error: null, gen: supervisor.generation });
   } catch (err: any) {
-    write({ id, result: null, error: String(err?.message ?? err), gen: supervisor.generation });
+    write({ id, result: null, error: friendlyDriverError(err), gen: supervisor.generation });
   }
 }

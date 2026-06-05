@@ -16,15 +16,18 @@ namespace MswordUse.WordDriver
     {
         static Word.Application _app;
 
-        // HRESULTs that indicate the cached COM pointer is dead and we must
-        // re-attach. Source: MS-RPCE / OLE error codes.
+        // HRESULTs that indicate the cached COM pointer is dead (or no Word is
+        // running at all) and we must re-attach. Source: MS-RPCE / OLE error codes.
         //   0x800706BA = RPC_S_SERVER_UNAVAILABLE  (Word process gone)
         //   0x80010108 = RPC_E_DISCONNECTED         (object disconnected from clients)
         //   0x800401FD = CO_E_OBJNOTCONNECTED       (object not connected)
+        //   0x800401E3 = MK_E_UNAVAILABLE           (no Word.Application in ROT —
+        //                                            either Word isn't running, or
+        //                                            it's still starting up)
         public static bool IsDisconnected(COMException ex)
         {
             uint h = (uint)ex.HResult;
-            return h == 0x800706BAu || h == 0x80010108u || h == 0x800401FDu;
+            return h == 0x800706BAu || h == 0x80010108u || h == 0x800401FDu || h == 0x800401E3u;
         }
 
         public static object Attach()
@@ -34,8 +37,17 @@ namespace MswordUse.WordDriver
             {
                 return Describe();
             }
-            var obj = Marshal.GetActiveObject("Word.Application");
-            _app = obj as Word.Application;
+            try
+            {
+                var obj = Marshal.GetActiveObject("Word.Application");
+                _app = obj as Word.Application;
+            }
+            catch (COMException ex) when (IsDisconnected(ex))
+            {
+                // Translate the raw HRESULT into a message friendlyDriverError
+                // can recognize on the agent side.
+                throw new Exception("Word.Application not found (is Word running?)");
+            }
             if (_app == null) throw new Exception("Word.Application not found (is Word running?)");
             return Describe();
         }

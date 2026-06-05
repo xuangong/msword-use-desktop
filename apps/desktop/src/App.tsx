@@ -1,191 +1,342 @@
-import { useEffect, useState, useRef, useMemo, useCallback } from "react";
+/**
+ * Main window: chat history + debug events panel.
+ *
+ * Architecture (v0.4):
+ * - All state lives in Jotai atoms keyed by sessionId. Spotlight-issued
+ *   chats and main-window-issued chats share the same atoms; the spotlight
+ *   creates a session id, announces it via `chat:start`, and the main
+ *   window switches `currentSessionIdAtom` to it.
+ * - The single ingestion point is `appendEventAtom`. Every IPC event
+ *   (bun:reply, chat:start, driver_restart, etc.) is normalized into one
+ *   DebugEvent and folded into ChatTurns via that atom.
+ * - The chat pane reads `currentTurnsAtom`; the debug pane reads
+ *   `currentEventsAtom`. Switching sessions just updates the atom — no
+ *   imperative re-render plumbing.
+ */
+
+import { useEffect, useState, useRef, useMemo } from "react";
+import { useAtom, useAtomValue, useSetAtom } from "jotai";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { JsonView, defaultStyles } from "react-json-view-lite";
+import "react-json-view-lite/dist/index.css";
 import "./App.css";
-import type {
-  AgentEvent,
-  SidecarMessage,
-  WordContext,
-  WordSelection,
-  WordOutline,
-  WordAttach,
-} from "./types";
+import {
+  appendEventAtom,
+  clearAllAtom,
+  currentEventsAtom,
+  currentSessionIdAtom,
+  currentTurnsAtom,
+  currentWordCtxAtom,
+  sessionIdsAtom,
+  setWordCtxAtom,
+} from "./state/atoms";
+import type { ChatTurn, DebugEvent, DebugEventKind, ToolCall, WordContextSnapshot } from "./state/types";
 
-type Bubble =
-  | { kind: "user"; id: string; text: string }
-  | { kind: "assistant"; id: string; text: string; done: boolean; stopReason?: string | null }
-  | { kind: "tool"; id: string; name: string; input: unknown; result?: unknown }
-  | { kind: "raw"; id: string; reply: string }
-  | { kind: "system"; id: string; text: string };
+function rid(): string {
+  return Math.random().toString(36).slice(2, 10);
+}
 
-function App() {
-  const [bubbles, setBubbles] = useState<Bubble[]>([]);
+interface AgentEventInner {
+  kind: "text_delta" | "tool_call" | "tool_result" | "done" | "error" | "llm_request" | "llm_response";
+  text?: string;
+  id?: string;
+  name?: string;
+  input?: unknown;
+  result?: unknown;
+  stopReason?: string | null;
+  error?: string;
+  payload?: any;
+}
+
+export default function App() {
   const [input, setInput] = useState("");
   const [lastSent, setLastSent] = useState("");
   const [pending, setPending] = useState(false);
   const [driverGen, setDriverGen] = useState<number | null>(null);
   const [driverReady, setDriverReady] = useState(false);
-  const [wordCtx, setWordCtx] = useState<WordContext | null>(null);
-  const scrollRef = useRef<HTMLDivElement>(null);
-  // Map from sidecar msg id → bubble id (assistant streaming aggregates here)
-  const assistantBubbleId = useRef<Map<string, string>>(new Map());
-  // Pending Word-context request ids — sidecar replies for these update the
-  // right panel instead of inserting a chat bubble.
-  const ctxPending = useRef<Map<string, "attach" | "selection" | "outline">>(new Map());
 
-  const refreshContext = useCallback(async () => {
-    if (!driverReady) return;
-    for (const method of ["attach", "observe.selection", "observe.outline"] as const) {
-      const id = `ctx:${method}:${rid()}`;
-      ctxPending.current.set(id, method.replace("observe.", "") as any);
-      try {
-        await invoke("bun_send", { line: JSON.stringify({ id, method, params: {} }) });
-      } catch {
-        ctxPending.current.delete(id);
-      }
-    }
-  }, [driverReady]);
+  const turns = useAtomValue(currentTurnsAtom);
+  const events = useAtomValue(currentEventsAtom);
+  const wordCtx = useAtomValue(currentWordCtxAtom);
+  const [currentSessionId, setCurrentSessionId] = useAtom(currentSessionIdAtom);
+  const sessionIds = useAtomValue(sessionIdsAtom);
+  const appendEvent = useSetAtom(appendEventAtom);
+  const setWordCtx = useSetAtom(setWordCtxAtom);
+  const clearAll = useSetAtom(clearAllAtom);
+
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const mountedAt = useRef<number>(Date.now());
+  /** Map from sidecar reply id (chat-xxx) -> sessionId */
+  const idToSession = useRef<Map<string, string>>(new Map());
+  /** Polls already running for a given chat id (de-dupe). */
+  const polledIds = useRef<Set<string>>(new Set());
+
+  // ---- IPC ingestion ----
 
   useEffect(() => {
-    const unlistenReply = listen<string>("bun:reply", (e) => {
+    const offReply = listen<string>("bun:reply", (e) => {
       try {
-        const msg: SidecarMessage = JSON.parse(e.payload);
-        handleSidecarMessage(msg);
+        const msg = JSON.parse(e.payload);
+        handleSidecarReply(msg);
       } catch {
-        push({ kind: "system", id: rid(), text: `parse fail: ${e.payload}` });
+        /* not JSON, ignore */
       }
     });
-    const unlistenLog = listen<string>("bun:log", (e) => {
-      push({ kind: "system", id: rid(), text: e.payload });
+    const offLog = listen<string>("bun:log", (e) => {
+      const line = e.payload;
+      if (/error|fail|panic|exit|timeout/i.test(line)) {
+        const sid = currentSessionId ?? "global";
+        appendEvent({
+          id: rid(),
+          ts: Date.now(),
+          sessionId: sid,
+          kind: "system",
+          text: line,
+          severity: "error",
+        });
+      }
     });
     return () => {
-      void unlistenReply.then((u) => u());
-      void unlistenLog.then((u) => u());
+      void offReply.then((u) => u());
+      void offLog.then((u) => u());
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentSessionId]);
+
+  // Spotlight-initiated chats: receive sessionId + user message + trigger.
+  useEffect(() => {
+    const off = listen<{
+      id: string;
+      message: string;
+      sessionId?: string;
+      trigger?: { title?: string; class?: string; isWord?: boolean; pid?: number };
+    }>("chat:start", (e) => {
+      const { id, message, sessionId: spotlightSid, trigger } = e.payload;
+      const sid = spotlightSid ?? `s-${rid()}`;
+      idToSession.current.set(id, sid);
+      setCurrentSessionId(sid);
+      // Stamp the session's Word context with what Rust captured at hotkey time.
+      // Selection text comes later via observe.selection (driver call).
+      if (trigger) {
+        setWordCtx({
+          sessionId: sid,
+          patch: {
+            triggerTitle: trigger.title,
+            triggerClass: trigger.class,
+            source: "spotlight",
+          },
+        });
+      }
+      appendEvent({
+        id: rid(),
+        ts: Date.now(),
+        sessionId: sid,
+        messageId: id,
+        kind: "user_message",
+        text: message,
+      });
+      startPollChat(id, sid);
+    });
+    return () => {
+      void off.then((u) => u());
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // On mount, sync sidecar status (HMR-safe) + register as reply subscriber.
   useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
-  }, [bubbles]);
+    invoke("register_subscriber", { name: "main" }).catch(() => {});
+    invoke<{ ready: boolean; gen: number }>("app_status")
+      .then((s) => {
+        if (s.ready) {
+          setDriverReady(true);
+          setDriverGen(s.gen);
+        }
+      })
+      .catch(() => {});
+  }, []);
 
-  // Initial context fetch when sidecar becomes ready.
-  useEffect(() => {
-    if (driverReady) refreshContext();
-  }, [driverReady, refreshContext]);
+  function handleSidecarReply(msg: any) {
+    const sid = (msg.id && idToSession.current.get(msg.id)) ?? currentSessionId ?? "global";
 
-  // Auto-refresh context every 5s while idle.
-  useEffect(() => {
-    if (!driverReady || pending) return;
-    const t = setInterval(refreshContext, 5000);
-    return () => clearInterval(t);
-  }, [driverReady, pending, refreshContext]);
-
-  function push(b: Bubble) {
-    setBubbles((bs) => [...bs, b]);
-  }
-
-  function updateAssistantText(msgId: string, deltaText: string) {
-    setBubbles((bs) => {
-      let bubbleId = assistantBubbleId.current.get(msgId);
-      if (!bubbleId) {
-        bubbleId = rid();
-        assistantBubbleId.current.set(msgId, bubbleId);
-        return [...bs, { kind: "assistant", id: bubbleId, text: deltaText, done: false }];
-      }
-      return bs.map((b) =>
-        b.kind === "assistant" && b.id === bubbleId
-          ? { ...b, text: b.text + deltaText }
-          : b,
-      );
-    });
-  }
-
-  function finishAssistant(msgId: string, stopReason: string | null) {
-    setBubbles((bs) => {
-      const bubbleId = assistantBubbleId.current.get(msgId);
-      if (!bubbleId) return bs;
-      return bs.map((b) =>
-        b.kind === "assistant" && b.id === bubbleId ? { ...b, done: true, stopReason } : b,
-      );
-    });
-    setPending(false);
-  }
-
-  function handleSidecarMessage(msg: SidecarMessage) {
     if (msg.ready) {
       setDriverReady(true);
       setDriverGen(msg.gen ?? 1);
-      push({ kind: "system", id: rid(), text: `驱动就绪 (gen=${msg.gen ?? "?"})` });
+      appendEvent({
+        id: rid(),
+        ts: Date.now(),
+        sessionId: sid,
+        kind: "system",
+        text: `驱动就绪 gen=${msg.gen ?? "?"}`,
+        severity: "info",
+      });
       return;
     }
-
     if (msg.kind === "driver_restart") {
       setDriverGen(msg.to ?? null);
-      push({
-        kind: "system",
+      appendEvent({
         id: rid(),
-        text: `⚠️ 驱动重启 gen ${msg.from} → ${msg.to}（原因：${msg.reason ?? "未知"}）`,
+        ts: Date.now(),
+        sessionId: sid,
+        kind: "system",
+        text: `⚠️ 驱动重启 gen ${msg.from} → ${msg.to}（${msg.reason ?? "?"}）`,
+        severity: "warn",
       });
       return;
     }
-
     if (msg.gen != null) setDriverGen(msg.gen);
 
-    // Context (right-panel) requests: don't show in chat.
-    if (msg.id && ctxPending.current.has(msg.id)) {
-      const which = ctxPending.current.get(msg.id)!;
-      ctxPending.current.delete(msg.id);
-      setWordCtx((prev) => {
-        const next: WordContext = {
-          attach: prev?.attach ?? null,
-          selection: prev?.selection ?? null,
-          outline: prev?.outline ?? null,
-          refreshedAt: Date.now(),
-          error: msg.error ?? undefined,
-        };
-        if (!msg.error && msg.result) {
-          if (which === "attach") next.attach = msg.result as WordAttach;
-          if (which === "selection") next.selection = msg.result as WordSelection;
-          if (which === "outline") next.outline = msg.result as WordOutline;
-        }
-        return next;
-      });
-      return;
-    }
-
     if (msg.kind === "agent_event" && msg.event) {
-      const ev: AgentEvent = msg.event;
-      const id = msg.id ?? "";
-      if (ev.kind === "text_delta") {
-        updateAssistantText(id, ev.text);
-      } else if (ev.kind === "tool_call") {
-        push({ kind: "tool", id: ev.id, name: ev.name, input: ev.input });
-      } else if (ev.kind === "tool_result") {
-        setBubbles((bs) =>
-          bs.map((b) =>
-            b.kind === "tool" && b.id === ev.id ? { ...b, result: ev.result } : b,
-          ),
-        );
-      } else if (ev.kind === "done") {
-        finishAssistant(id, ev.stopReason ?? null);
-        // Pull fresh Word state after the agent finished editing.
-        setTimeout(refreshContext, 100);
-      } else if (ev.kind === "error") {
-        push({ kind: "system", id: rid(), text: `❌ ${ev.error}` });
-        setPending(false);
-      }
+      ingestAgentEvent(msg.id ?? "", msg.event, sid);
       return;
     }
 
-    // raw RPC reply
-    push({
-      kind: "raw",
-      id: msg.id ?? rid(),
-      reply: JSON.stringify(msg, null, 2),
-    });
-    setPending(false);
+    // Driver RPC reply (raw)
+    if (msg.id && msg.result != null) {
+      appendEvent({
+        id: rid(),
+        ts: Date.now(),
+        sessionId: sid,
+        kind: "driver_recv",
+        requestId: msg.id,
+        result: msg.result,
+        error: null,
+      });
+    } else if (msg.error) {
+      appendEvent({
+        id: rid(),
+        ts: Date.now(),
+        sessionId: sid,
+        kind: "driver_recv",
+        requestId: msg.id,
+        error: msg.error,
+      });
+    }
   }
+
+  function ingestAgentEvent(chatId: string, ev: AgentEventInner, sid: string) {
+    const base = {
+      id: rid(),
+      ts: Date.now(),
+      sessionId: sid,
+      messageId: chatId,
+    };
+    if (ev.kind === "text_delta") {
+      appendEvent({ ...base, kind: "text_delta", text: ev.text ?? "" });
+    } else if (ev.kind === "tool_call") {
+      appendEvent({
+        ...base,
+        kind: "tool_call",
+        toolUseId: ev.id ?? rid(),
+        name: ev.name ?? "(unknown)",
+        input: ev.input,
+      });
+      // Side effect: if the tool call carries selection info, update the
+      // session's Word context. polish_text's input has paragraph_index
+      // when target='paragraph'; pinnedRange (set by spotlight) has start/end.
+      const inp: any = ev.input;
+      if (inp && typeof inp === "object") {
+        const patch: Partial<WordContextSnapshot> = {};
+        if (typeof inp.paragraph_index === "number") {
+          patch.paragraphIndex = inp.paragraph_index;
+        }
+        if (Object.keys(patch).length > 0) {
+          setWordCtx({ sessionId: sid, patch });
+        }
+      }
+    } else if (ev.kind === "tool_result") {
+      const ok = (ev.result as any)?.ok !== false;
+      appendEvent({
+        ...base,
+        kind: "tool_result",
+        toolUseId: ev.id ?? "",
+        name: ev.name ?? "",
+        result: ev.result,
+        ok,
+      });
+      // Surface "what got operated on" into the session's Word context so the
+      // header strip can show "段 5 · 一、培训目标" even mid-chat.
+      const r: any = ev.result;
+      if (r && typeof r === "object" && r.preview_original) {
+        setWordCtx({
+          sessionId: sid,
+          patch: {
+            selectionText: r.preview_original,
+            paragraphIndex: r.paragraph_index ?? null,
+          },
+        });
+      }
+    } else if (ev.kind === "done") {
+      appendEvent({
+        ...base,
+        kind: "done",
+        stopReason: ev.stopReason ?? null,
+        finalText: typeof (ev as any).text === "string" ? (ev as any).text : "",
+      });
+      setPending(false);
+    } else if (ev.kind === "error") {
+      appendEvent({ ...base, kind: "error", error: ev.error ?? "(unknown)" });
+      setPending(false);
+    } else if (ev.kind === "llm_request") {
+      const p = ev.payload ?? {};
+      appendEvent({
+        ...base,
+        kind: "llm_request",
+        model: p.model ?? "",
+        system: p.system ?? "",
+        messages: p.messages,
+        tools: p.tools,
+        cacheSystem: !!p.cacheSystem,
+        maxTokens: p.maxTokens ?? 0,
+      });
+    } else if (ev.kind === "llm_response") {
+      const p = ev.payload ?? {};
+      appendEvent({
+        ...base,
+        kind: "llm_response",
+        stopReason: p.stopReason ?? null,
+        text: p.text ?? "",
+        toolUses: p.toolUses,
+        usage: p.usage,
+      });
+    }
+  }
+
+  // ---- chat poll (Tauri 2 emit_to → listen unreliable in this webview) ----
+
+  function startPollChat(chatId: string, sid: string) {
+    if (polledIds.current.has(chatId)) return;
+    polledIds.current.add(chatId);
+    const start = Date.now();
+    let done = false;
+    const tick = async () => {
+      if (done) return;
+      const replies = await invoke<string[]>("spotlight_take_reply", {
+        subscriber: "main",
+        id: chatId,
+      }).catch(() => [] as string[]);
+      for (const raw of replies) {
+        try {
+          const msg = JSON.parse(raw);
+          // Make sure session lookup works.
+          if (msg.id) idToSession.current.set(msg.id, sid);
+          handleSidecarReply(msg);
+          if (msg.kind === "agent_event" && (msg.event?.kind === "done" || msg.event?.kind === "error")) {
+            done = true;
+          }
+        } catch { /* ignore */ }
+      }
+      if (!done && Date.now() - start < 60_000) {
+        setTimeout(tick, 100);
+      } else {
+        polledIds.current.delete(chatId);
+      }
+    };
+    setTimeout(tick, 50);
+  }
+
+  // ---- main-window send ----
 
   async function send(textOverride?: string) {
     const line = (textOverride ?? input).trim();
@@ -193,9 +344,12 @@ function App() {
     if (!textOverride) setInput("");
     setLastSent(line);
 
-    // `/` prefix = raw RPC, otherwise = chat
     const isRaw = line.startsWith("/");
-    const id = rid();
+    const id = `chat-${rid()}`;
+    // Use existing session if any, else create a new one.
+    const sid = currentSessionId ?? `s-${rid()}`;
+    if (!currentSessionId) setCurrentSessionId(sid);
+    idToSession.current.set(id, sid);
 
     if (isRaw) {
       const parts = line.slice(1).split(/\s+/);
@@ -209,38 +363,105 @@ function App() {
         }
       }
       const payload = { id, method, params };
-      push({ kind: "user", id: rid(), text: line });
+      appendEvent({
+        id: rid(),
+        ts: Date.now(),
+        sessionId: sid,
+        kind: "driver_send",
+        method: method ?? "",
+        params,
+        requestId: id,
+      });
       setPending(true);
       try {
         await invoke("bun_send", { line: JSON.stringify(payload) });
       } catch (err) {
-        push({ kind: "system", id: rid(), text: `invoke failed: ${err}` });
+        appendEvent({
+          id: rid(),
+          ts: Date.now(),
+          sessionId: sid,
+          kind: "system",
+          text: `invoke failed: ${err}`,
+          severity: "error",
+        });
         setPending(false);
       }
     } else {
-      push({ kind: "user", id: rid(), text: line });
+      appendEvent({
+        id: rid(),
+        ts: Date.now(),
+        sessionId: sid,
+        messageId: id,
+        kind: "user_message",
+        text: line,
+      });
       setPending(true);
       const payload = { kind: "chat", id, message: line };
       try {
         await invoke("bun_send", { line: JSON.stringify(payload) });
+        startPollChat(id, sid);
       } catch (err) {
-        push({ kind: "system", id: rid(), text: `invoke failed: ${err}` });
+        appendEvent({
+          id: rid(),
+          ts: Date.now(),
+          sessionId: sid,
+          kind: "system",
+          text: `invoke failed: ${err}`,
+          severity: "error",
+        });
         setPending(false);
       }
     }
   }
 
+  // Auto-scroll only when near the bottom.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (distanceFromBottom < 120) {
+      el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+    }
+  }, [turns]);
+
   return (
     <main className="h-full flex flex-col bg-neutral-50 text-neutral-900">
       <header className="px-4 py-3 border-b border-neutral-200 bg-white flex items-baseline gap-3 shrink-0">
         <h1 className="text-lg font-semibold">msword-use</h1>
-        <p className="text-xs text-neutral-500">
-          v2-alpha · 自然语言操作 Word · 所有改动走修订模式
-        </p>
+        <p className="text-xs text-neutral-500">v2-alpha · 自然语言操作 Word · 修订模式</p>
+        {sessionIds.length > 0 && (
+          <select
+            value={currentSessionId ?? ""}
+            onChange={(e) => setCurrentSessionId(e.currentTarget.value || null)}
+            className="text-xs border border-neutral-300 rounded px-1.5 py-0.5 bg-white"
+            title="切换会话"
+          >
+            {sessionIds.map((id, i) => (
+              <option key={id} value={id}>
+                会话 {i + 1}
+              </option>
+            ))}
+          </select>
+        )}
+        {wordCtx && <WordCtxBar ctx={wordCtx} />}
         <div className="ml-auto flex items-center gap-3 text-xs">
+          <button
+            type="button"
+            onClick={clearAll}
+            disabled={sessionIds.length === 0}
+            className="text-neutral-500 hover:text-neutral-900 disabled:opacity-30"
+            title="清空所有会话"
+          >
+            🗑 清空
+          </button>
           <span className={driverReady ? "text-green-700" : "text-amber-600"}>
-            <span className={"inline-block w-1.5 h-1.5 rounded-full mr-1 " + (driverReady ? "bg-green-500" : "bg-amber-500 animate-pulse")} />
-            驱动 {driverReady ? `gen=${driverGen ?? "?"}` : "启动中…"}
+            <span
+              className={
+                "inline-block w-1.5 h-1.5 rounded-full mr-1 " +
+                (driverReady ? "bg-green-500" : "bg-amber-500 animate-pulse")
+              }
+            />
+            驱动 {driverReady ? `gen=${driverGen ?? "?"}` : <BootTimer startedAt={mountedAt.current} />}
           </span>
           <span className="text-neutral-400">
             指令前加 <code className="bg-neutral-100 px-1 rounded">/</code> 走原始 RPC
@@ -251,19 +472,19 @@ function App() {
       <div className="flex-1 flex overflow-hidden">
         {/* Left: chat */}
         <div className="flex-1 flex flex-col min-w-0">
-          <section ref={scrollRef} className="flex-1 p-4 overflow-auto space-y-3">
-            {bubbles.length === 0 && (
+          <section ref={scrollRef} className="flex-1 p-4 overflow-auto space-y-4">
+            {turns.length === 0 ? (
               <div className="text-neutral-400 text-sm">
-                试试：在 Word 里选一段文字，然后输入 <span className="font-mono">"把这段改成公文风格"</span>
+                试试：在 Word 里选段，按 <kbd className="bg-neutral-100 px-1 rounded">Ctrl+Alt+J</kbd>{" "}
+                唤起 spotlight 输入指令。或在下方输入框直接打 <span className="font-mono">"把这段改成公文"</span>。
               </div>
+            ) : (
+              turns.map((t) => <TurnView key={t.id} turn={t} />)
             )}
-            {bubbles.map((b) => (
-              <BubbleView key={b.id + ":" + b.kind} b={b} />
-            ))}
           </section>
 
           <form
-            className="p-3 border-t border-neutral-200 bg-white flex gap-2 items-center"
+            className="p-3 border-t border-neutral-200 bg-white flex gap-2 items-center shrink-0"
             onSubmit={(e) => {
               e.preventDefault();
               send();
@@ -281,7 +502,6 @@ function App() {
               <button
                 type="button"
                 onClick={() => send(lastSent)}
-                title={`重试: ${lastSent}`}
                 className="px-3 py-2 text-xs text-neutral-600 border border-neutral-300 rounded hover:bg-neutral-50"
               >
                 ↻ 重试
@@ -297,90 +517,91 @@ function App() {
           </form>
         </div>
 
-        {/* Right: Word context panel */}
-        <aside className="w-80 border-l border-neutral-200 bg-white overflow-auto shrink-0">
-          <WordContextPanel ctx={wordCtx} onRefresh={refreshContext} />
+        {/* Right: debug panel */}
+        <aside className="w-96 border-l border-neutral-200 bg-white overflow-hidden shrink-0 flex flex-col">
+          <DebugPanel events={events} />
         </aside>
       </div>
     </main>
   );
 }
 
-function BubbleView({ b }: { b: Bubble }) {
-  if (b.kind === "user") {
-    return (
+// ============================================================
+// Chat turn renderer
+// ============================================================
+
+function TurnView({ turn }: { turn: ChatTurn }) {
+  return (
+    <div className="space-y-2">
       <div className="flex justify-end">
-        <div className="max-w-[80%] bg-blue-600 text-white rounded-2xl rounded-tr-sm px-4 py-2 text-sm whitespace-pre-wrap">
-          {b.text}
+        <div className="max-w-[80%] bg-blue-600 text-white rounded-2xl rounded-tr-sm px-4 py-2 text-sm whitespace-pre-wrap break-words">
+          {turn.userText}
         </div>
       </div>
-    );
-  }
-  if (b.kind === "assistant") {
-    return (
-      <div className="flex justify-start">
-        <div className="max-w-[80%] bg-white border border-neutral-200 rounded-2xl rounded-tl-sm px-4 py-2 text-sm whitespace-pre-wrap">
-          {b.text || <span className="text-neutral-400">…思考中</span>}
-          {!b.done && b.text && <span className="text-neutral-400 animate-pulse"> ▍</span>}
+
+      {turn.toolCalls.map((tc) => (
+        <ToolCallView key={tc.toolUseId} tc={tc} />
+      ))}
+
+      {(turn.assistantText || turn.streaming) && (
+        <div className="flex justify-start">
+          <div className="max-w-[85%] bg-white border border-neutral-200 rounded-2xl rounded-tl-sm px-4 py-2 text-sm whitespace-pre-wrap break-words">
+            {turn.assistantText || <span className="text-neutral-400">...</span>}
+            {turn.streaming && turn.assistantText && (
+              <span className="text-neutral-400 animate-pulse">▍</span>
+            )}
+          </div>
         </div>
-      </div>
-    );
-  }
-  if (b.kind === "tool") {
-    return <ToolBubble b={b} />;
-  }
-  if (b.kind === "raw") {
-    let pretty = b.reply;
-    try { pretty = JSON.stringify(JSON.parse(b.reply), null, 2); } catch {}
-    return (
-      <pre className="font-mono text-xs bg-neutral-100 border border-neutral-200 rounded p-2 whitespace-pre-wrap break-words">
-        {pretty}
-      </pre>
-    );
-  }
-  return <div className="text-xs text-neutral-400">[sys] {b.text}</div>;
+      )}
+
+      {turn.error && (
+        <div className="text-xs text-red-700 bg-red-50 border border-red-200 rounded p-2">
+          ❌ {turn.error}
+        </div>
+      )}
+    </div>
+  );
 }
 
-function ToolBubble({ b }: { b: Extract<Bubble, { kind: "tool" }> }) {
+function ToolCallView({ tc }: { tc: ToolCall }) {
   const [open, setOpen] = useState(false);
+  const status = tc.result == null ? "pending" : tc.ok === false ? "error" : "ok";
+  const dot =
+    status === "ok" ? "bg-green-500" : status === "error" ? "bg-red-500" : "bg-amber-500 animate-pulse";
   const summary = useMemo(() => {
-    const inputStr = JSON.stringify(b.input);
-    return `${b.name}(${inputStr.length > 60 ? inputStr.slice(0, 60) + "…" : inputStr})`;
-  }, [b]);
-  const ok = b.result == null ? "pending" : (b.result as any)?.ok === false ? "error" : "ok";
+    const inp = JSON.stringify(tc.input);
+    return inp.length > 60 ? inp.slice(0, 60) + "…" : inp;
+  }, [tc.input]);
 
   return (
     <div className="flex justify-start">
-      <div className="max-w-[80%] w-full">
+      <div className="max-w-[85%] w-full">
         <button
           type="button"
           onClick={() => setOpen((o) => !o)}
-          className="text-left w-full text-xs font-mono border border-neutral-200 bg-neutral-50 rounded px-2 py-1 hover:bg-neutral-100"
+          className="text-left w-full text-xs font-mono border border-neutral-200 bg-neutral-50 rounded px-2 py-1 hover:bg-neutral-100 flex items-center gap-2"
         >
-          <span className={
-            ok === "ok" ? "text-green-700"
-              : ok === "error" ? "text-red-700"
-              : "text-neutral-400"
-          }>
-            {ok === "ok" ? "✓" : ok === "error" ? "✗" : "…"}
-          </span>{" "}
-          <span className="text-neutral-700">{summary}</span>
-          <span className="text-neutral-400 ml-2">{open ? "▾" : "▸"}</span>
+          <span className={`inline-block w-1.5 h-1.5 rounded-full ${dot}`} />
+          <span className="text-neutral-700 font-semibold">{tc.name}</span>
+          <span className="text-neutral-500 truncate flex-1">{summary}</span>
+          <span className="text-neutral-400">{open ? "▾" : "▸"}</span>
         </button>
         {open && (
-          <div className="border border-t-0 border-neutral-200 rounded-b bg-white p-2 text-xs font-mono space-y-2">
+          <div className="border border-t-0 border-neutral-200 rounded-b bg-white p-2 text-xs space-y-2">
             <div>
               <div className="text-neutral-500 mb-1">input:</div>
-              <pre className="bg-neutral-50 p-2 rounded whitespace-pre-wrap">
-                {JSON.stringify(b.input, null, 2)}
-              </pre>
+              <JsonView data={tc.input as object} style={defaultStyles} shouldExpandNode={() => true} />
             </div>
-            <div>
-              <div className="text-neutral-500 mb-1">result:</div>
-              <pre className="bg-neutral-50 p-2 rounded whitespace-pre-wrap">
-                {b.result == null ? "…" : JSON.stringify(b.result, null, 2)}
-              </pre>
-            </div>
+            {tc.result !== undefined && (
+              <div>
+                <div className="text-neutral-500 mb-1">result:</div>
+                <JsonView
+                  data={tc.result as object}
+                  style={defaultStyles}
+                  shouldExpandNode={() => true}
+                />
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -388,100 +609,185 @@ function ToolBubble({ b }: { b: Extract<Bubble, { kind: "tool" }> }) {
   );
 }
 
-function WordContextPanel({
-  ctx,
-  onRefresh,
-}: {
-  ctx: WordContext | null;
-  onRefresh: () => void;
-}) {
+// ============================================================
+// Debug panel (right-side)
+// ============================================================
+
+function DebugPanel({ events }: { events: DebugEvent[] }) {
+  const [filter, setFilter] = useState<"all" | DebugEventKind>("all");
+  const visible = useMemo(
+    () => (filter === "all" ? events : events.filter((e) => e.kind === filter)),
+    [events, filter],
+  );
+  // We render newest-first.
+  const reversed = useMemo(() => [...visible].reverse(), [visible]);
+
   return (
-    <div className="p-4 space-y-4 text-sm">
-      <div className="flex items-baseline justify-between">
-        <h2 className="font-semibold text-neutral-800">Word 上下文</h2>
-        <button
-          type="button"
-          onClick={onRefresh}
-          className="text-xs text-neutral-500 hover:text-neutral-900"
+    <>
+      <div className="px-4 py-3 border-b border-neutral-200 flex items-center gap-2 shrink-0">
+        <h2 className="text-sm font-semibold text-neutral-800">事件</h2>
+        <span className="text-xs text-neutral-400">
+          {visible.length}/{events.length}
+        </span>
+        <select
+          value={filter}
+          onChange={(e) => setFilter(e.target.value as any)}
+          className="ml-auto text-xs border border-neutral-300 rounded px-1.5 py-0.5 bg-white"
         >
-          ↻ 刷新
-        </button>
+          <option value="all">全部</option>
+          <option value="user_message">user</option>
+          <option value="llm_request">llm_request</option>
+          <option value="llm_response">llm_response</option>
+          <option value="text_delta">text_delta</option>
+          <option value="tool_call">tool_call</option>
+          <option value="tool_result">tool_result</option>
+          <option value="done">done</option>
+          <option value="error">error</option>
+          <option value="driver_send">driver_send</option>
+          <option value="driver_recv">driver_recv</option>
+          <option value="system">system</option>
+        </select>
       </div>
-
-      {!ctx && <div className="text-neutral-400 text-xs">加载中…</div>}
-
-      {ctx?.error && (
-        <div className="text-xs text-red-600 bg-red-50 border border-red-200 rounded p-2">
-          {ctx.error}
-        </div>
-      )}
-
-      {ctx?.attach && (
-        <section>
-          <div className="text-xs text-neutral-500 mb-1">活动文档</div>
-          <div className="font-medium">{ctx.attach.activeDoc ?? <span className="text-neutral-400">（无）</span>}</div>
-          <div className="text-xs text-neutral-500 mt-1">
-            Word {ctx.attach.version} · {ctx.attach.documents} 份文档打开
+      <div className="flex-1 overflow-auto">
+        {reversed.length === 0 ? (
+          <div className="p-4 text-xs text-neutral-400">
+            暂无事件。在 Word 选段，按 Ctrl+Alt+J 唤起 spotlight。
           </div>
-        </section>
-      )}
-
-      {ctx?.selection && (
-        <section>
-          <div className="text-xs text-neutral-500 mb-1">当前选区</div>
-          {ctx.selection.isEmpty ? (
-            <div className="text-neutral-400 text-xs">（无选区，光标在 段 {ctx.selection.paragraphIndex ?? "?"} ）</div>
-          ) : (
-            <div>
-              <div className="bg-blue-50 border border-blue-100 rounded p-2 text-xs whitespace-pre-wrap line-clamp-6">
-                {ctx.selection.text.trim() || "(空)"}
-              </div>
-              <div className="text-xs text-neutral-400 mt-1">
-                {ctx.selection.end - ctx.selection.start} 字符
-                {ctx.selection.paragraphIndex && ` · 段 ${ctx.selection.paragraphIndex}`}
-                {ctx.selection.page && ` · 第 ${ctx.selection.page} 页`}
-              </div>
-            </div>
-          )}
-        </section>
-      )}
-
-      {ctx?.outline && ctx.outline.outline.length > 0 && (
-        <section>
-          <div className="text-xs text-neutral-500 mb-1">
-            大纲 · {ctx.outline.outline.length} / {ctx.outline.total}
-            {ctx.outline.truncated && " （截断）"}
-          </div>
-          <ul className="space-y-1">
-            {ctx.outline.outline.map((n, i) => (
-              <li
-                key={i}
-                className="text-xs truncate"
-                style={{ paddingLeft: (n.level - 1) * 12 }}
-              >
-                <span className="text-neutral-400 mr-1">H{n.level}</span>
-                {n.text}
-              </li>
+        ) : (
+          <ul className="divide-y divide-neutral-100">
+            {reversed.map((ev) => (
+              <EventRow key={ev.id} ev={ev} />
             ))}
           </ul>
-        </section>
-      )}
-
-      {ctx?.outline && ctx.outline.outline.length === 0 && (
-        <div className="text-xs text-neutral-400">(文档没有 heading 段落)</div>
-      )}
-
-      {ctx?.refreshedAt && (
-        <div className="text-xs text-neutral-300 pt-2 border-t border-neutral-100">
-          {new Date(ctx.refreshedAt).toLocaleTimeString()}
-        </div>
-      )}
-    </div>
+        )}
+      </div>
+    </>
   );
 }
 
-function rid(): string {
-  return Math.random().toString(36).slice(2, 10);
+function EventRow({ ev }: { ev: DebugEvent }) {
+  const [open, setOpen] = useState(false);
+  const time = new Date(ev.ts).toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+  const summary = summaryOf(ev);
+  const cls = colorOf(ev.kind);
+
+  return (
+    <li className="text-xs">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="w-full px-3 py-1.5 flex items-center gap-2 hover:bg-neutral-50 text-left"
+      >
+        <span className="text-neutral-400 font-mono shrink-0">{time}</span>
+        <span className={`font-mono px-1 rounded shrink-0 ${cls}`}>{ev.kind}</span>
+        <span className="truncate text-neutral-700 flex-1">{summary}</span>
+        <span className="text-neutral-300 shrink-0">{open ? "▾" : "▸"}</span>
+      </button>
+      {open && (
+        <div className="px-3 pb-2 text-[10px] bg-neutral-50">
+          <JsonView data={ev as unknown as object} style={defaultStyles} shouldExpandNode={() => true} />
+        </div>
+      )}
+    </li>
+  );
 }
 
-export default App;
+function summaryOf(ev: DebugEvent): string {
+  switch (ev.kind) {
+    case "user_message":
+      return ev.text.slice(0, 80);
+    case "text_delta":
+      return JSON.stringify(ev.text);
+    case "tool_call":
+      return `${ev.name}(${JSON.stringify(ev.input).slice(0, 60)})`;
+    case "tool_result":
+      return `${ev.name} → ${ev.ok ? "ok" : "fail"}`;
+    case "done":
+      return `stop=${ev.stopReason}`;
+    case "error":
+      return ev.error;
+    case "system":
+      return ev.text;
+    case "driver_send":
+      return `→ ${ev.method}`;
+    case "driver_recv":
+      return ev.error ? `← error: ${ev.error}` : `← ${ev.requestId ?? "(?)"}`;
+    case "llm_request": {
+      const msgCount = Array.isArray(ev.messages) ? ev.messages.length : 0;
+      const toolCount = Array.isArray(ev.tools) ? ev.tools.length : 0;
+      return `${ev.model} · ${msgCount} msgs · ${toolCount} tools`;
+    }
+    case "llm_response": {
+      const u: any = ev.usage ?? {};
+      const cache = u.cache_read_input_tokens ? ` cache_read=${u.cache_read_input_tokens}` : "";
+      return `stop=${ev.stopReason} · in=${u.input_tokens ?? "?"} out=${u.output_tokens ?? "?"}${cache}`;
+    }
+  }
+}
+
+function colorOf(kind: DebugEventKind): string {
+  switch (kind) {
+    case "user_message": return "text-blue-700 bg-blue-50";
+    case "text_delta": return "text-neutral-600 bg-neutral-100";
+    case "tool_call": return "text-purple-700 bg-purple-50";
+    case "tool_result": return "text-purple-700 bg-purple-50";
+    case "done": return "text-green-700 bg-green-50";
+    case "error": return "text-red-700 bg-red-50";
+    case "system": return "text-neutral-600 bg-neutral-100";
+    case "driver_send": return "text-amber-700 bg-amber-50";
+    case "driver_recv": return "text-amber-700 bg-amber-50";
+    case "llm_request": return "text-indigo-700 bg-indigo-50";
+    case "llm_response": return "text-indigo-700 bg-indigo-50";
+  }
+}
+
+function BootTimer({ startedAt }: { startedAt: number }) {
+  const [secs, setSecs] = useState(((Date.now() - startedAt) / 1000).toFixed(1));
+  useEffect(() => {
+    const t = setInterval(() => {
+      setSecs(((Date.now() - startedAt) / 1000).toFixed(1));
+    }, 100);
+    return () => clearInterval(t);
+  }, [startedAt]);
+  return <>启动中 {secs}s…</>;
+}
+
+/** Compact "linked to <doc> · 段 N · selection" strip in the header. */
+function WordCtxBar({ ctx }: { ctx: WordContextSnapshot }) {
+  // Strip the trailing " - Word" so the doc name is short.
+  const docName =
+    ctx.docName ??
+    (ctx.triggerTitle
+      ? ctx.triggerTitle.replace(/\s*-\s*(Microsoft\s+)?Word\s*$/i, "")
+      : null);
+  if (!docName && !ctx.selectionText) return null;
+  const selPreview = ctx.selectionText
+    ? ctx.selectionText.length > 40
+      ? ctx.selectionText.slice(0, 40) + "…"
+      : ctx.selectionText
+    : null;
+  return (
+    <span className="text-xs text-neutral-500 flex items-center gap-1.5 px-2 py-0.5 bg-neutral-100 rounded">
+      <span>📄</span>
+      <span className="text-neutral-800 font-medium truncate max-w-[160px]">
+        {docName ?? "(未链接)"}
+      </span>
+      {ctx.paragraphIndex != null && (
+        <>
+          <span className="text-neutral-400">·</span>
+          <span>段 {ctx.paragraphIndex}</span>
+        </>
+      )}
+      {selPreview && (
+        <>
+          <span className="text-neutral-400">·</span>
+          <span className="italic text-neutral-600 truncate max-w-[180px]">"{selPreview}"</span>
+        </>
+      )}
+    </span>
+  );
+}

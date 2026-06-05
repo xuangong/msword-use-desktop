@@ -12,9 +12,31 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "msword-use",
-        "width": 1000,
-        "height": 720
+        "width": 1100,
+        "height": 760,
+        "visible": true,
+        "skipTaskbar": false
+      },
+      {
+        "label": "spotlight",
+        "title": "msword-use spotlight",
+        "url": "spotlight.html",
+        "width": 720,
+        "height": 92,
+        "minWidth": 720,
+        "minHeight": 92,
+        "maxWidth": 720,
+        "maxHeight": 320,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "resizable": false,
+        "center": true,
+        "visible": false,
+        "focus": false
       }
     ],
     "security": {

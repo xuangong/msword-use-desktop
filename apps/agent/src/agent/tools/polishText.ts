@@ -56,6 +56,10 @@ export interface PolishToolInput {
   style: PolishPreset;
   custom_style?: string | null;
   extra_instruction?: string | null;
+  /** Internal: an exact char range pinned by the spotlight UI at hotkey time.
+   * When set, we operate on this range directly without re-reading the
+   * (potentially stale) Application.Selection. Not exposed to the LLM. */
+  pinnedRange?: { start: number; end: number; text?: string };
 }
 
 export interface PolishToolResult {
@@ -105,7 +109,23 @@ export async function runPolish(
   let targetRange: TargetRange;
   let paragraphIndex: number | null = null;
 
-  if (target === "selection") {
+  // Pinned range from the spotlight UI takes precedence — it captures the
+  // user's exact selection at hotkey time, before any focus/selection drift.
+  if (input.pinnedRange) {
+    originalText = input.pinnedRange.text ?? "";
+    if (!originalText) {
+      // We have offsets but no text — fetch via observe.paragraph as a
+      // fallback to reconstruct the original. Cheap, single COM round-trip.
+      try {
+        const sel = await supervisor.call("observe.selection");
+        if (!sel.isEmpty) {
+          originalText = sel.text;
+        }
+      } catch { /* ignore — we can polish even without original */ }
+    }
+    paragraphIndex = null;
+    targetRange = { kind: "range", start: input.pinnedRange.start, end: input.pinnedRange.end };
+  } else if (target === "selection") {
     let sel;
     try {
       sel = await supervisor.call("observe.selection");

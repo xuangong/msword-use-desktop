@@ -18,6 +18,7 @@ export interface DriverClientLike {
   callRaw(method: string, params?: unknown): Promise<unknown>;
   kill(): void;
   exited(): Promise<number>;
+  isClosed?(): boolean;
 }
 
 export interface SupervisorOptions extends DriverClientOptions {
@@ -51,11 +52,28 @@ export class Supervisor {
   }
 
   async call<M extends MethodName>(method: M, params?: Params<M>): Promise<Result<M>> {
+    await this.ensureAlive();
     return await this.runWithTimeout(() => this.client.call(method, params), method);
   }
 
   async callRaw(method: string, params?: unknown): Promise<unknown> {
+    await this.ensureAlive();
     return await this.runWithTimeout(() => this.client.callRaw(method, params), method);
+  }
+
+  /**
+   * If the underlying driver child died (crashed, killed externally, etc),
+   * respawn before serving the next call. This is the "self-healing" path —
+   * runWithTimeout handles hangs; ensureAlive handles deaths.
+   *
+   * We DON'T route this through handleHang's per-minute throttle: a
+   * Word-killed-by-user death is not a runaway-loop signal and shouldn't
+   * count against the hang budget.
+   */
+  private async ensureAlive(): Promise<void> {
+    if ((this.client as any).isClosed?.()) {
+      await this.restart();
+    }
   }
 
   private async runWithTimeout<T>(fn: () => Promise<T>, method: string): Promise<T> {

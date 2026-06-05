@@ -53,7 +53,29 @@ export interface StreamOptions {
   model?: string;
   maxTokens?: number;
   cacheSystem?: boolean;
+  /** Optional observability hook — fires once before sending and once after.
+   * Used by the agent loop to ship the exact prompt + response to the UI's
+   * debug panel so devs can see what the model is actually seeing. */
+  onTrace?: (event: TraceEvent) => void;
 }
+
+export type TraceEvent =
+  | {
+      kind: "llm_request";
+      model: string;
+      system: string;
+      messages: MessageInput[];
+      tools: ToolSpec[];
+      cacheSystem: boolean;
+      maxTokens: number;
+    }
+  | {
+      kind: "llm_response";
+      stopReason: string | null;
+      text: string;
+      toolUses: Array<{ id: string; name: string; input: unknown }>;
+      usage?: unknown;
+    };
 
 /** Discriminated stream events the sidecar can forward to the UI. */
 export type StreamEvent =
@@ -67,17 +89,33 @@ export type StreamEvent =
  */
 export async function* streamMessage(opts: StreamOptions): AsyncGenerator<StreamEvent> {
   const cli = client();
+  const cacheSystem = opts.cacheSystem !== false;
   const systemBlocks: any[] = [
     {
       type: "text",
       text: opts.system,
-      ...(opts.cacheSystem !== false ? { cache_control: { type: "ephemeral" } } : {}),
+      ...(cacheSystem ? { cache_control: { type: "ephemeral" } } : {}),
     },
   ];
 
+  const model = opts.model ?? DEFAULT_MODEL;
+  const maxTokens = opts.maxTokens ?? DEFAULT_MAX_TOKENS;
+
+  // Fire the request trace BEFORE the network call so devs can see exactly
+  // what we're about to send.
+  opts.onTrace?.({
+    kind: "llm_request",
+    model,
+    system: opts.system,
+    messages: opts.messages,
+    tools: opts.tools ?? [],
+    cacheSystem,
+    maxTokens,
+  });
+
   const stream = cli.messages.stream({
-    model: opts.model ?? DEFAULT_MODEL,
-    max_tokens: opts.maxTokens ?? DEFAULT_MAX_TOKENS,
+    model,
+    max_tokens: maxTokens,
     system: systemBlocks,
     messages: opts.messages as any,
     tools: opts.tools as any,
@@ -95,16 +133,32 @@ export async function* streamMessage(opts: StreamOptions): AsyncGenerator<Stream
 
   const finalMessage = await stream.finalMessage();
   // Surface any tool_use blocks once the message is complete (they're not deltas).
+  const toolUses: Array<{ id: string; name: string; input: unknown }> = [];
+  let assistantText = "";
   for (const block of finalMessage.content) {
     if (block.type === "tool_use") {
+      toolUses.push({ id: block.id, name: block.name, input: block.input });
       yield {
         type: "tool_use",
         id: block.id,
         name: block.name,
         input: block.input,
       };
+    } else if (block.type === "text") {
+      assistantText += block.text;
     }
   }
+
+  // Fire the response trace AFTER the model finishes so devs can inspect
+  // tokens, stop reason, and the full assembled message.
+  opts.onTrace?.({
+    kind: "llm_response",
+    stopReason: finalMessage.stop_reason ?? null,
+    text: assistantText,
+    toolUses,
+    usage: finalMessage.usage,
+  });
+
   yield {
     type: "message_stop",
     stopReason: finalMessage.stop_reason ?? null,

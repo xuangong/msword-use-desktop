@@ -38,7 +38,14 @@ const SYSTEM_PROMPT = `你是 msword-use 桌面应用的 AI 助手，专门帮�
 回复用中文，简洁。`;
 
 export interface AgentEvent {
-  kind: "text_delta" | "tool_call" | "tool_result" | "done" | "error";
+  kind:
+    | "text_delta"
+    | "tool_call"
+    | "tool_result"
+    | "done"
+    | "error"
+    | "llm_request"
+    | "llm_response";
   text?: string;
   id?: string;
   name?: string;
@@ -46,6 +53,18 @@ export interface AgentEvent {
   result?: unknown;
   stopReason?: string | null;
   error?: string;
+  // llm_request / llm_response payloads (kept generic to avoid type churn).
+  payload?: unknown;
+}
+
+/** Pinned operation target captured by the spotlight UI at hotkey time, so
+ * the tool doesn't drift to a stale Word selection while the LLM thinks. */
+export interface PinnedTarget {
+  kind: "range";
+  start: number;
+  end: number;
+  paragraphIndex?: number;
+  textPreview?: string;
 }
 
 const TOOLS: ToolSpec[] = [polishTextSpec];
@@ -53,8 +72,19 @@ const TOOLS: ToolSpec[] = [polishTextSpec];
 export async function* runAgentTurn(
   userMessage: string,
   supervisor: Supervisor,
+  target?: PinnedTarget,
 ): AsyncGenerator<AgentEvent> {
-  const messages: MessageInput[] = [{ role: "user", content: userMessage }];
+  // If the spotlight pinned a target, surface it to the LLM as plain text in
+  // the user message AND pass it through as tool input later, so the tool
+  // doesn't fall back to observe.selection (which can drift).
+  let userText = userMessage;
+  if (target?.kind === "range") {
+    userText =
+      `[操作目标已锁定] 段 ${target.paragraphIndex ?? "?"} · 范围 ${target.start}-${target.end}` +
+      (target.textPreview ? ` · "${target.textPreview}"` : "") +
+      `\n\n用户指令：${userMessage}`;
+  }
+  const messages: MessageInput[] = [{ role: "user", content: userText }];
 
   let assistantText = "";
   let lastStopReason: string | null = null;
@@ -63,6 +93,10 @@ export async function* runAgentTurn(
   for (let iter = 0; iter < 6; iter++) {
     let turnText = "";
     const toolUses: Array<{ id: string; name: string; input: unknown }> = [];
+    // Trace events are buffered here so we can yield them in-band with
+    // text_delta/tool_call without rewriting streamMessage to AsyncGenerator
+    // of a wider type. The yields happen after each iter sees each ev.
+    const traceBuffer: Array<{ kind: "llm_request" | "llm_response"; payload: unknown }> = [];
 
     try {
       for await (const ev of streamMessage({
@@ -70,7 +104,15 @@ export async function* runAgentTurn(
         messages,
         tools: TOOLS,
         cacheSystem: true,
+        onTrace: (t) => {
+          traceBuffer.push({ kind: t.kind, payload: t });
+        },
       })) {
+        // Drain any pending trace events before each underlying SDK event.
+        while (traceBuffer.length > 0) {
+          const t = traceBuffer.shift()!;
+          yield { kind: t.kind, payload: t.payload };
+        }
         if (ev.type === "text_delta") {
           turnText += ev.text;
           yield { kind: "text_delta", text: ev.text };
@@ -80,6 +122,11 @@ export async function* runAgentTurn(
         } else if (ev.type === "message_stop") {
           lastStopReason = ev.stopReason;
         }
+      }
+      // Flush trailing trace events (llm_response fires after the SDK loop ends).
+      while (traceBuffer.length > 0) {
+        const t = traceBuffer.shift()!;
+        yield { kind: t.kind, payload: t.payload };
       }
     } catch (err: any) {
       yield { kind: "error", error: friendlyDriverError(err) };
@@ -109,7 +156,7 @@ export async function* runAgentTurn(
     for (const tu of toolUses) {
       let result: unknown;
       try {
-        result = await dispatchTool(tu.name, tu.input, supervisor);
+        result = await dispatchTool(tu.name, tu.input, supervisor, target);
       } catch (err: any) {
         result = { ok: false, error: String(err?.message ?? err) };
       }
@@ -127,10 +174,29 @@ export async function* runAgentTurn(
   yield { kind: "done", text: assistantText, stopReason: "max_iters" };
 }
 
-async function dispatchTool(name: string, input: unknown, supervisor: Supervisor) {
+async function dispatchTool(
+  name: string,
+  input: unknown,
+  supervisor: Supervisor,
+  target?: PinnedTarget,
+) {
   switch (name) {
-    case "polish_text":
-      return runPolish(input as PolishToolInput, supervisor);
+    case "polish_text": {
+      // If the spotlight pinned a target, we use it instead of letting the
+      // tool fall back to (potentially stale) Application.Selection.
+      // Strategy: pass the precise start/end through a side channel as a
+      // "pinnedRange" the tool honors. This preserves the user's exact
+      // character range — switching to paragraph mode would expand to the
+      // whole paragraph, which is wrong if the user only selected part.
+      const merged: PolishToolInput & { pinnedRange?: { start: number; end: number; text?: string } } =
+        target?.kind === "range"
+          ? {
+              ...(input as PolishToolInput),
+              pinnedRange: { start: target.start, end: target.end, text: target.textPreview },
+            }
+          : (input as PolishToolInput);
+      return runPolish(merged, supervisor);
+    }
     default:
       throw new Error(`unknown tool: ${name}`);
   }

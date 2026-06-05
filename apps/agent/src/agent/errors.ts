@@ -5,7 +5,8 @@
  */
 
 const PATTERNS: Array<[RegExp, string]> = [
-  [/Word\.Application not found|no running Word/i, "未检测到正在运行的 Word。请先启动 Microsoft Word 并打开一份文档。"],
+  [/Word\.Application not found|no running Word|0x800401E3|MK_E_UNAVAILABLE|Operation unavailable/i,
+    "未检测到正在运行的 Word。请先启动 Microsoft Word 并打开一份文档，然后点击右上角『刷新』。"],
   [/no active document/i, "Word 当前没有打开任何文档。请先在 Word 里打开或新建一份文档。"],
   [/bookmark not found/i, "找不到指定的书签，文档可能已被修改。请刷新后重试。"],
   [/protection|protected/i, "文档处于保护模式，无法编辑。请在 Word 中解除保护后重试。"],
