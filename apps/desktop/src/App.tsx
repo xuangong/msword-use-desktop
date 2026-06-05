@@ -32,6 +32,30 @@ import {
   setWordCtxAtom,
 } from "./state/atoms";
 import type { ChatTurn, DebugEvent, DebugEventKind, ToolCall, WordContextSnapshot } from "./state/types";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+
+async function openPerfWindow() {
+  // Reuse existing window if user already opened it.
+  const existing = await WebviewWindow.getByLabel("perf");
+  if (existing) {
+    await existing.show();
+    await existing.setFocus();
+    return;
+  }
+  const win = new WebviewWindow("perf", {
+    url: "perf.html",
+    title: "性能监视器",
+    width: 980,
+    height: 720,
+    resizable: true,
+  });
+  // Surface load errors so the button isn't silent on failure.
+  win.once("tauri://error", (e) => {
+    console.error("[perf-window] failed:", e);
+  });
+}
 
 function rid(): string {
   return Math.random().toString(36).slice(2, 10);
@@ -55,6 +79,7 @@ export default function App() {
   const [pending, setPending] = useState(false);
   const [driverGen, setDriverGen] = useState<number | null>(null);
   const [driverReady, setDriverReady] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
 
   const turns = useAtomValue(currentTurnsAtom);
   const events = useAtomValue(currentEventsAtom);
@@ -78,6 +103,12 @@ export default function App() {
     const offReply = listen<string>("bun:reply", (e) => {
       try {
         const msg = JSON.parse(e.payload);
+        // Agent events arrive on TWO paths in the main window: this listener AND
+        // the per-chat-id polling started in send()/chat:start. Skip them here
+        // so the chat UI doesn't duplicate every tool_call/text_delta — polling
+        // is the source of truth for chat-id-keyed events. Non-chat messages
+        // (ready, driver_restart, raw RPC replies) still flow through here.
+        if (msg.kind === "agent_event") return;
         handleSidecarReply(msg);
       } catch {
         /* not JSON, ignore */
@@ -426,14 +457,49 @@ export default function App() {
 
   return (
     <main className="h-full flex flex-col bg-neutral-50 text-neutral-900">
-      <header className="px-4 py-3 border-b border-neutral-200 bg-white flex items-baseline gap-3 shrink-0">
-        <h1 className="text-lg font-semibold">msword-use</h1>
-        <p className="text-xs text-neutral-500">v2-alpha · 自然语言操作 Word · 修订模式</p>
+      <header className="px-4 py-3 border-b border-neutral-200 bg-white flex items-center gap-3 shrink-0 whitespace-nowrap">
+        <h1 className="text-lg font-semibold shrink-0">msword-use</h1>
+        <p
+          className="text-xs text-neutral-500 shrink min-w-0 truncate"
+          title="v2-alpha · 自然语言操作 Word · 修订模式"
+        >
+          v2-alpha · 自然语言操作 Word · 修订模式
+        </p>
+        <div className="relative shrink-0">
+          <button
+            type="button"
+            onClick={() => setMenuOpen((v) => !v)}
+            onBlur={() => setTimeout(() => setMenuOpen(false), 150)}
+            className="text-xs px-2 py-1 rounded border border-neutral-300 hover:bg-neutral-50 text-neutral-700"
+            aria-haspopup="menu"
+            aria-expanded={menuOpen}
+          >
+            菜单 ▾
+          </button>
+          {menuOpen && (
+            <div
+              role="menu"
+              className="absolute left-0 top-full mt-1 z-50 bg-white border border-neutral-200 rounded shadow-lg min-w-[160px] py-1 text-sm"
+            >
+              <button
+                role="menuitem"
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  setMenuOpen(false);
+                  void openPerfWindow();
+                }}
+                className="w-full text-left px-3 py-1.5 hover:bg-neutral-100"
+              >
+                性能监视器
+              </button>
+            </div>
+          )}
+        </div>
         {sessionIds.length > 0 && (
           <select
             value={currentSessionId ?? ""}
             onChange={(e) => setCurrentSessionId(e.currentTarget.value || null)}
-            className="text-xs border border-neutral-300 rounded px-1.5 py-0.5 bg-white"
+            className="text-xs border border-neutral-300 rounded px-1.5 py-0.5 bg-white shrink-0"
             title="切换会话"
           >
             {sessionIds.map((id, i) => (
@@ -443,8 +509,8 @@ export default function App() {
             ))}
           </select>
         )}
-        {wordCtx && <WordCtxBar ctx={wordCtx} />}
-        <div className="ml-auto flex items-center gap-3 text-xs">
+        {wordCtx && <div className="min-w-0 shrink truncate"><WordCtxBar ctx={wordCtx} /></div>}
+        <div className="ml-auto flex items-center gap-3 text-xs shrink-0">
           <button
             type="button"
             onClick={clearAll}
@@ -463,7 +529,7 @@ export default function App() {
             />
             驱动 {driverReady ? `gen=${driverGen ?? "?"}` : <BootTimer startedAt={mountedAt.current} />}
           </span>
-          <span className="text-neutral-400">
+          <span className="text-neutral-400 hidden lg:inline" title="指令前加 / 走原始 RPC">
             指令前加 <code className="bg-neutral-100 px-1 rounded">/</code> 走原始 RPC
           </span>
         </div>
@@ -545,8 +611,16 @@ function TurnView({ turn }: { turn: ChatTurn }) {
 
       {(turn.assistantText || turn.streaming) && (
         <div className="flex justify-start">
-          <div className="max-w-[85%] bg-white border border-neutral-200 rounded-2xl rounded-tl-sm px-4 py-2 text-sm whitespace-pre-wrap break-words">
-            {turn.assistantText || <span className="text-neutral-400">...</span>}
+          <div className="max-w-[85%] bg-white border border-neutral-200 rounded-2xl rounded-tl-sm px-4 py-2 text-sm break-words">
+            {turn.assistantText ? (
+              <div className="markdown-body">
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                  {turn.assistantText}
+                </ReactMarkdown>
+              </div>
+            ) : (
+              <span className="text-neutral-400">...</span>
+            )}
             {turn.streaming && turn.assistantText && (
               <span className="text-neutral-400 animate-pulse">▍</span>
             )}
@@ -615,12 +689,54 @@ function ToolCallView({ tc }: { tc: ToolCall }) {
 
 function DebugPanel({ events }: { events: DebugEvent[] }) {
   const [filter, setFilter] = useState<"all" | DebugEventKind>("all");
+  // Kinds the user has muted via the chip toolbar. Default: hide the noisy
+  // driver_send/driver_recv pair so polish_text doesn't drown out tool_call /
+  // text_delta / done. Toggle from the chip strip below.
+  const [hidden, setHidden] = useState<Set<DebugEventKind>>(
+    () => new Set<DebugEventKind>(["driver_send", "driver_recv"]),
+  );
   const visible = useMemo(
-    () => (filter === "all" ? events : events.filter((e) => e.kind === filter)),
-    [events, filter],
+    () =>
+      events.filter((e) => {
+        if (filter !== "all" && e.kind !== filter) return false;
+        if (filter === "all" && hidden.has(e.kind)) return false;
+        return true;
+      }),
+    [events, filter, hidden],
   );
   // We render newest-first.
   const reversed = useMemo(() => [...visible].reverse(), [visible]);
+
+  const toggleHidden = (k: DebugEventKind) => {
+    setHidden((prev) => {
+      const next = new Set(prev);
+      if (next.has(k)) next.delete(k);
+      else next.add(k);
+      return next;
+    });
+  };
+
+  // Per-kind counts so the chip can show "driver_recv (47)" — useful to know
+  // what you're hiding before you toggle it.
+  const counts = useMemo(() => {
+    const m = new Map<DebugEventKind, number>();
+    for (const e of events) m.set(e.kind, (m.get(e.kind) ?? 0) + 1);
+    return m;
+  }, [events]);
+
+  const allKinds: DebugEventKind[] = [
+    "user_message",
+    "llm_request",
+    "llm_response",
+    "text_delta",
+    "tool_call",
+    "tool_result",
+    "done",
+    "error",
+    "driver_send",
+    "driver_recv",
+    "system",
+  ];
 
   return (
     <>
@@ -648,6 +764,30 @@ function DebugPanel({ events }: { events: DebugEvent[] }) {
           <option value="system">system</option>
         </select>
       </div>
+      {filter === "all" && (
+        <div className="px-3 py-2 border-b border-neutral-100 flex flex-wrap gap-1 shrink-0">
+          {allKinds.map((k) => {
+            const isHidden = hidden.has(k);
+            const c = counts.get(k) ?? 0;
+            return (
+              <button
+                key={k}
+                onClick={() => toggleHidden(k)}
+                title={isHidden ? `点击显示 ${k}` : `点击隐藏 ${k}`}
+                className={
+                  "text-[10px] font-mono px-1.5 py-0.5 rounded border " +
+                  (isHidden
+                    ? "bg-neutral-50 text-neutral-400 border-neutral-200 line-through"
+                    : "bg-white text-neutral-700 border-neutral-300 hover:bg-neutral-50")
+                }
+              >
+                {k}
+                {c > 0 && <span className="ml-1 text-neutral-400">{c}</span>}
+              </button>
+            );
+          })}
+        </div>
+      )}
       <div className="flex-1 overflow-auto">
         {reversed.length === 0 ? (
           <div className="p-4 text-xs text-neutral-400">
@@ -771,7 +911,16 @@ function WordCtxBar({ ctx }: { ctx: WordContextSnapshot }) {
       : ctx.selectionText
     : null;
   return (
-    <span className="text-xs text-neutral-500 flex items-center gap-1.5 px-2 py-0.5 bg-neutral-100 rounded">
+    <span
+      className="text-xs text-neutral-500 flex items-center gap-1.5 px-2 py-0.5 bg-neutral-100 rounded"
+      title={[
+        docName,
+        ctx.paragraphIndex != null ? `段 ${ctx.paragraphIndex}` : null,
+        ctx.selectionText ? `"${ctx.selectionText}"` : null,
+      ]
+        .filter(Boolean)
+        .join(" · ")}
+    >
       <span>📄</span>
       <span className="text-neutral-800 font-medium truncate max-w-[160px]">
         {docName ?? "(未链接)"}

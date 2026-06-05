@@ -292,21 +292,24 @@ fn which_on_path(name: &str) -> Result<std::path::PathBuf, ()> {
 }
 
 fn spawn_sidecar(app: &AppHandle) -> Result<Child, String> {
-    let agent_index = {
+    let repo_root = {
         let mut p = std::env::current_dir().map_err(|e| e.to_string())?;
         p.pop(); // -> apps/desktop
         p.pop(); // -> apps
-        p.push("agent");
-        p.push("src");
-        p.push("index.ts");
+        p.pop(); // -> repo root
         p
     };
+    let agent_index = repo_root.join("apps").join("agent").join("src").join("index.ts");
 
     let bun = locate_bun()?;
-    eprintln!("[main] spawning Bun sidecar: {:?} run {:?}", bun, agent_index);
+    eprintln!("[main] spawning Bun sidecar: {:?} run {:?} (cwd={:?})", bun, agent_index, repo_root);
+    // cwd=repo_root so Bun auto-loads `.env` / `.env.local` from the repo root
+    // (Bun reads dotenv files relative to the process cwd). Lets users set
+    // ANTHROPIC_API_KEY in a gitignored .env instead of in their shell.
     let mut child = Command::new(&bun)
         .arg("run")
         .arg(&agent_index)
+        .current_dir(&repo_root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -87,7 +87,7 @@ function handleLine(line: string) {
     }
     enqueueChat(async () => {
       try {
-        for await (const ev of runAgentTurn(message, supervisor, req.target)) {
+        for await (const ev of runAgentTurn(message, supervisor, req.target, id ?? undefined)) {
           write({ id, kind: "agent_event", event: ev, gen: supervisor.generation });
         }
       } catch (err: any) {

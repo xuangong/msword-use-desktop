@@ -44,7 +44,19 @@ namespace MswordUse.WordDriver
 
                 try
                 {
-                    object result = Dispatch(method, paramsObj);
+                    object result;
+                    using (Perf.Scope(id, method))
+                    {
+                        var sw = System.Diagnostics.Stopwatch.StartNew();
+                        result = Dispatch(method, paramsObj);
+                        sw.Stop();
+                        // Top-level RPC wall time. Tagged with the same scope so
+                        // it correlates to its child COM calls in the perf view.
+                        if (method != null && !method.StartsWith("_perf."))
+                        {
+                            Perf.Record("rpc:" + method, sw.ElapsedTicks * 1000_000L / System.Diagnostics.Stopwatch.Frequency, 0);
+                        }
+                    }
                     WriteResponse(id, result, null);
                 }
                 catch (Exception ex)
@@ -89,6 +101,33 @@ namespace MswordUse.WordDriver
                     return Methods.Polish.ReplaceRange(p);
                 case "polish.addComment":
                     return Methods.Polish.AddComment(p);
+
+                // ----- perf telemetry -----
+                // _-prefixed = raw channel, never appears in the public schema.
+                case "_perf.dump":
+                {
+                    long since = p["since"]?.ToObject<long?>() ?? 0L;
+                    return new { entries = Perf.Dump(since), now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() };
+                }
+                case "_perf.summary":
+                {
+                    long since = p["since"]?.ToObject<long?>() ?? 0L;
+                    return Perf.Summary(since);
+                }
+                case "_perf.clear":
+                    Perf.Clear();
+                    return new { ok = true };
+                case "_perf.record":
+                {
+                    // Sidecar pushes its own timings (e.g. LLM wall time).
+                    string n = p["name"]?.ToString() ?? "(unknown)";
+                    long us = p["durationUs"]?.ToObject<long?>() ?? 0L;
+                    int ss = p["sampleSize"]?.ToObject<int?>() ?? 0;
+                    string rid = p["requestId"]?.ToString();
+                    string mth = p["method"]?.ToString();
+                    Perf.Record(n, us, ss, rid, mth);
+                    return new { ok = true };
+                }
 
                 case "shutdown":
                     // Return cleanly; the main loop writes our response then

@@ -18,17 +18,19 @@ namespace MswordUse.WordDriver.Methods
             string action = p["action"]?.ToString() ?? "polish:replace";
             bool track = p["track"]?.ToObject<bool?>() ?? true;
 
-            string original = rng.Text ?? "";
+            string original = Perf.Measure("Range.Text.get", () => rng.Text ?? "", 0);
             using (new RevisionScope(doc, track))
             {
-                rng.Text = newText;
+                Perf.Measure("Range.Text.set", () => { rng.Text = newText; }, newText.Length);
             }
+            int start = Perf.Measure("Range.Start.get", () => rng.Start, 0);
+            int end = Perf.Measure("Range.End.get", () => rng.End, 0);
             return new
             {
                 replacedChars = original.Length,
                 newChars = newText.Length,
-                rangeStart = rng.Start,
-                rangeEnd = rng.End
+                rangeStart = start,
+                rangeEnd = end
             };
         }
 
@@ -39,24 +41,24 @@ namespace MswordUse.WordDriver.Methods
             string text = p["text"]?.ToString() ?? "";
             string author = p["author"]?.ToString() ?? "msword-use AI";
 
-            var app = doc.Application;
-            string prevAuthor = app.UserName;
+            var app = Perf.Measure("Document.Application.get", () => doc.Application, 0);
+            string prevAuthor = Perf.Measure("Application.UserName.get", () => app.UserName, 0);
             Word.Comment comment;
             try
             {
-                app.UserName = author;
-                comment = doc.Comments.Add(rng, text);
+                Perf.Measure("Application.UserName.set", () => { app.UserName = author; }, 0);
+                comment = Perf.Measure("Comments.Add", () => doc.Comments.Add(rng, text), text.Length);
             }
             finally
             {
-                app.UserName = prevAuthor;
+                Perf.Measure("Application.UserName.set", () => { app.UserName = prevAuthor; }, 0);
             }
+            string scopeText = Perf.Measure("Range.Text.get", () => rng.Text ?? "", 0);
+            int commentIdx = Perf.Measure("Comment.Index.get", () => comment.Index, 0);
             return new
             {
-                commentIndex = comment.Index,
-                scope = (rng.Text ?? "").Length > 80
-                    ? (rng.Text ?? "").Substring(0, 80)
-                    : (rng.Text ?? "")
+                commentIndex = commentIdx,
+                scope = scopeText.Length > 80 ? scopeText.Substring(0, 80) : scopeText
             };
         }
 
@@ -69,14 +71,15 @@ namespace MswordUse.WordDriver.Methods
 
             if (!string.IsNullOrEmpty(bookmark))
             {
-                if (!doc.Bookmarks.Exists(bookmark))
+                bool exists = Perf.Measure("Bookmarks.Exists", () => doc.Bookmarks.Exists(bookmark), 0);
+                if (!exists)
                     throw new Exception("bookmark not found: " + bookmark);
-                return doc.Bookmarks[bookmark].Range;
+                return Perf.Measure("Bookmarks[].Range", () => doc.Bookmarks[bookmark].Range, 0);
             }
             if (paraIdx.HasValue)
-                return doc.Paragraphs[paraIdx.Value].Range;
+                return Perf.Measure("Paragraphs[].Range", () => doc.Paragraphs[paraIdx.Value].Range, 0);
             if (start.HasValue && end.HasValue)
-                return doc.Range(start.Value, end.Value);
+                return Perf.Measure("Document.Range", () => doc.Range(start.Value, end.Value), 0);
             throw new Exception("must provide bookmark, paragraphIndex, or start+end");
         }
     }
@@ -95,14 +98,14 @@ namespace MswordUse.WordDriver.Methods
         public RevisionScope(Word.Document doc, bool enabled)
         {
             _doc = doc;
-            _prev = _doc.TrackRevisions;
+            _prev = Perf.Measure("Document.TrackRevisions.get", () => _doc.TrackRevisions, 0);
             _enabled = enabled;
-            if (enabled) _doc.TrackRevisions = true;
+            if (enabled) Perf.Measure("Document.TrackRevisions.set", () => { _doc.TrackRevisions = true; }, 0);
         }
 
         public void Dispose()
         {
-            if (_enabled) _doc.TrackRevisions = _prev;
+            if (_enabled) Perf.Measure("Document.TrackRevisions.set", () => { _doc.TrackRevisions = _prev; }, 0);
         }
     }
 }

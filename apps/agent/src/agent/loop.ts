@@ -73,6 +73,7 @@ export async function* runAgentTurn(
   userMessage: string,
   supervisor: Supervisor,
   target?: PinnedTarget,
+  requestId?: string,
 ): AsyncGenerator<AgentEvent> {
   // If the spotlight pinned a target, surface it to the LLM as plain text in
   // the user message AND pass it through as tool input later, so the tool
@@ -97,6 +98,10 @@ export async function* runAgentTurn(
     // text_delta/tool_call without rewriting streamMessage to AsyncGenerator
     // of a wider type. The yields happen after each iter sees each ev.
     const traceBuffer: Array<{ kind: "llm_request" | "llm_response"; payload: unknown }> = [];
+
+    // Wall-clock timer around the LLM call. Reported back to the driver's
+    // perf buffer so the perf panel can show "this turn: 480ms LLM + 120ms COM".
+    const llmStart = Date.now();
 
     try {
       for await (const ev of streamMessage({
@@ -132,6 +137,20 @@ export async function* runAgentTurn(
       yield { kind: "error", error: friendlyDriverError(err) };
       return;
     }
+
+    // Push LLM wall time to driver perf buffer (fire-and-forget; never blocks
+    // the agent loop). Tagged with the same request_id as the chat turn so the
+    // perf panel can split "this turn: 480ms LLM + 120ms COM (35 calls)".
+    const llmDurUs = (Date.now() - llmStart) * 1000;
+    void supervisor
+      .callRaw("_perf.record", {
+        name: "llm.streamMessage",
+        durationUs: llmDurUs,
+        sampleSize: turnText.length,
+        requestId: requestId ?? null,
+        method: "agent.turn",
+      })
+      .catch(() => {});
 
     assistantText += turnText;
 

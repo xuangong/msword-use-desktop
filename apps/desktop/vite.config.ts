@@ -38,6 +38,7 @@ export default defineConfig(async () => ({
       input: {
         main: resolve(__dirname, "index.html"),
         spotlight: resolve(__dirname, "spotlight.html"),
+        perf: resolve(__dirname, "perf.html"),
       },
     },
   },
