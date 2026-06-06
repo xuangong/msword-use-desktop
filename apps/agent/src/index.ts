@@ -30,6 +30,52 @@ import { makeAgentFactory } from "./agent/agentFactory";
 import { SessionRegistry } from "./agent/sessionRegistry";
 import type { Agent, AgentEvent } from "@earendil-works/pi-agent-core";
 
+// ---------- Windows path-normalization wrapper for pi's NodeExecutionEnv ----------
+//
+// pi-agent-core 0.78.1's `loadSkills` and its path helpers (`relativeEnvPath`,
+// `fileInfoFromStats`) are POSIX-centric: they `split("/")` on returned paths
+// and prefix-match with `${root}/`. Node's `path.resolve` returns Windows-style
+// backslash paths on Windows, which break both.
+//
+// This thin wrapper rewrites `path` and recomputes `name` for every FileInfo
+// returned by NodeExecutionEnv so pi sees forward-slash paths everywhere.
+// Does not affect file-system access — `node:fs` accepts either separator on
+// Windows.
+//
+// Track upstream fix; remove when pi-agent-core handles Windows paths.
+function toPosixPath(p: string): string {
+  return p.replace(/\\/g, "/");
+}
+
+function basename(p: string): string {
+  const slash = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"));
+  return slash === -1 ? p : p.slice(slash + 1);
+}
+
+class PosixNodeExecutionEnv extends NodeExecutionEnv {
+  async fileInfo(p: string) {
+    const r = await super.fileInfo(p);
+    if (r.ok) {
+      const path = toPosixPath(r.value.path);
+      return { ok: true as const, value: { ...r.value, path, name: basename(path) } };
+    }
+    return r;
+  }
+  async listDir(p: string, abortSignal?: AbortSignal) {
+    const r = await super.listDir(p, abortSignal);
+    if (r.ok) {
+      return {
+        ok: true as const,
+        value: r.value.map((e) => {
+          const path = toPosixPath(e.path);
+          return { ...e, path, name: basename(path) };
+        }),
+      };
+    }
+    return r;
+  }
+}
+
 // ---------- driver supervisor ----------
 
 const driverExe =
@@ -44,7 +90,7 @@ supervisor.onGenChange = (info) => {
 // ---------- skills ----------
 
 const roots = resolveAllowedRoots();
-const env = new NodeExecutionEnv({ cwd: resolve(roots.skills, "..") });
+const env = new PosixNodeExecutionEnv({ cwd: resolve(roots.skills, "..") });
 const { skills, diagnostics } = await loadSkills(env, [roots.skills]);
 for (const d of diagnostics) {
   // Warnings about malformed SKILL.md — surface to stderr so a dev sees them
