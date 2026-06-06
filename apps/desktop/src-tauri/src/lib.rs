@@ -265,6 +265,104 @@ fn show_spotlight(app: &AppHandle) {
     }
 }
 
+#[derive(Clone, Serialize, Default)]
+struct SpotlightSnapshot {
+    paragraph_index: Option<u32>,
+    preview: String,
+}
+
+/// Send a `kind:"raw"` request to the sidecar with the SNAPSHOT_SCRIPT and
+/// wait up to 2s for the matching reply. On any failure (sidecar not up, no
+/// reply within budget, parse error, driver error), returns the default
+/// (no paragraph index, empty preview) — snapshot is best-effort.
+fn fetch_snapshot_blocking(seq: u64) -> SpotlightSnapshot {
+    let id = format!("snap_{}_{}", seq, std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0));
+
+    let payload = serde_json::json!({
+        "kind": "raw",
+        "id": id,
+        "code": SNAPSHOT_SCRIPT,
+    });
+    let line = match serde_json::to_string(&payload) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[snapshot] serialize failed: {}", e);
+            return SpotlightSnapshot::default();
+        }
+    };
+
+    // Write to sidecar stdin
+    let stdin_mutex = match SIDECAR_STDIN.get() {
+        Some(m) => m,
+        None => {
+            eprintln!("[snapshot] sidecar not initialized yet");
+            return SpotlightSnapshot::default();
+        }
+    };
+    if let Ok(mut stdin) = stdin_mutex.lock() {
+        if writeln!(stdin, "{}", line).is_err() {
+            eprintln!("[snapshot] write to sidecar failed");
+            return SpotlightSnapshot::default();
+        }
+        let _ = stdin.flush();
+    } else {
+        return SpotlightSnapshot::default();
+    }
+
+    // Poll the snapshot subscriber queue every 25ms, up to 2s.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
+    while std::time::Instant::now() < deadline {
+        let lines = SIDECAR_REPLIES
+            .lock()
+            .ok()
+            .and_then(|mut top| top.get_mut("snapshot").and_then(|q| q.remove(&id)))
+            .unwrap_or_default();
+        if !lines.is_empty() {
+            // Parse the FIRST line we got (sidecar emits a single raw_response per id).
+            let raw = &lines[0];
+            return parse_snapshot_line(raw);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    eprintln!("[snapshot] timed out after 2s");
+    SpotlightSnapshot::default()
+}
+
+fn parse_snapshot_line(raw: &str) -> SpotlightSnapshot {
+    let v: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[snapshot] parse failed: {}", e);
+            return SpotlightSnapshot::default();
+        }
+    };
+    // raw_response shape: {id, kind:"raw_response", result:..., stdout, error}
+    if v.get("error").and_then(|e| e.as_str()).is_some_and(|s| !s.is_empty()) {
+        eprintln!("[snapshot] driver error: {}", v["error"]);
+        return SpotlightSnapshot::default();
+    }
+    let result = match v.get("result") {
+        Some(r) => r,
+        None => return SpotlightSnapshot::default(),
+    };
+    let paragraph_index = result
+        .get("paragraphIndex")
+        .and_then(|p| p.as_u64())
+        .map(|n| n as u32);
+    let preview = result
+        .get("preview")
+        .and_then(|p| p.as_str())
+        .unwrap_or("")
+        .to_string();
+    SpotlightSnapshot {
+        paragraph_index,
+        preview,
+    }
+}
+
 #[tauri::command]
 fn debug_log(msg: String) {
     eprintln!("[ui] {}", msg);
@@ -442,6 +540,10 @@ pub fn run() {
                     }
                 });
             }
+
+            // Register a dedicated queue for spotlight snapshot replies so they
+            // don't race against the UI's main / spotlight subscriber queues.
+            ensure_subscriber("snapshot");
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
