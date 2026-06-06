@@ -5,22 +5,19 @@
   "description": "Drive Microsoft Word from a desktop UI via natural language",
   "workspaces": [
     "apps/desktop",
-    "apps/agent",
-    "packages/*"
+    "apps/agent"
   ],
   "scripts": {
-    "gen": "bun run scripts/gen-rpc-types.ts",
     "driver:build": "cd drivers/WordDriver && dotnet build -c Debug",
-    "driver:test": "bun run scripts/test-sidecar.ts",
+    "driver:test": "bun run scripts/test-driver.ts",
     "dev": "cd apps/desktop && bun run tauri dev",
-    "build": "bun run gen && bun run driver:build && cd apps/desktop && bun run tauri build",
+    "build": "bun run driver:build && cd apps/desktop && bun run tauri build",
     "spike": "drivers/WordDriver/bin/Debug/net48/WordDriver.exe"
   },
   "devDependencies": {
     "@earendil-works/pi-agent-core": "0.78.1",
     "@earendil-works/pi-ai": "0.78.1",
     "@types/bun": "latest",
-    "json-schema-to-typescript": "^15.0.0",
     "typebox": "1.1.38",
     "typescript": "^5.6.0"
   }
