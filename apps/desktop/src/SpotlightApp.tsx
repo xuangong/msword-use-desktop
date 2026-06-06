@@ -393,16 +393,7 @@ export default function SpotlightApp() {
       <div className="m-2 rounded-2xl shadow-2xl ring-1 ring-black/10 bg-white/95 backdrop-blur-md overflow-hidden">
         {ctx && ctx.paragraph_index != null && (
           <div
-            className="spotlight-target-strip"
-            style={{
-              padding: "6px 12px",
-              fontSize: "12px",
-              color: "#888",
-              borderBottom: "1px solid #2a2a2a",
-              whiteSpace: "nowrap",
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-            }}
+            className="px-3 py-1.5 text-xs text-neutral-600 border-b border-neutral-100 truncate"
             title={ctx.preview /* full preview on hover, in case truncated */}
           >
             📄 第 {ctx.paragraph_index} 段：「{ctx.preview || "(空段落)"}」
@@ -410,16 +401,7 @@ export default function SpotlightApp() {
         )}
         {ctx && ctx.paragraph_index == null && ctx.is_word === false && (
           <div
-            className="spotlight-target-strip spotlight-target-strip--inactive"
-            style={{
-              padding: "6px 12px",
-              fontSize: "12px",
-              color: "#666",
-              borderBottom: "1px solid #2a2a2a",
-              whiteSpace: "nowrap",
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-            }}
+            className="px-3 py-1.5 text-xs text-amber-700 bg-amber-50/60 border-b border-amber-200 truncate"
             title={ctx.trigger_title}
           >
             ⚠️ 当前不在 Word 窗口（{ctx.trigger_class || "未知"}）
