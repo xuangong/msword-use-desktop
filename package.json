@@ -17,8 +17,10 @@
     "spike": "drivers/WordDriver/bin/Debug/net48/WordDriver.exe"
   },
   "devDependencies": {
+    "@earendil-works/pi-agent-core": "0.78.1",
+    "@earendil-works/pi-ai": "0.78.1",
     "@types/bun": "latest",
-    "typescript": "^5.6.0",
-    "json-schema-to-typescript": "^15.0.0"
+    "json-schema-to-typescript": "^15.0.0",
+    "typescript": "^5.6.0"
   }
 }
