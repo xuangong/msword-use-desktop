@@ -98,19 +98,19 @@ namespace MswordUse.WordDriver.Roslyn
             if (string.IsNullOrWhiteSpace(code))
                 return new ExecResult { Error = "empty_code" };
 
-            // Attach to Word lazily: scripts that only read `App` still get
-            // a ready Application; if no Word is running this throws and we
-            // surface it as a runtime error.
-            Word.Document doc;
-            Word.Application app;
+            // Lazy attach: scripts that only use System types don't need Word.
+            // If Word isn't running, Doc/App stay null and the script will
+            // NRE on first use — surfaced as a runtime_error to the LLM.
+            Word.Document doc = null;
+            Word.Application app = null;
             try
             {
                 doc = WordSession.ActiveDoc();
                 app = doc.Application;
             }
-            catch (Exception ex)
+            catch
             {
-                return new ExecResult { Error = "word_unavailable: " + ex.Message };
+                /* leave nulls; LLM will see a clear runtime error if it tries to access Doc/App */
             }
 
             var globals = new Globals
