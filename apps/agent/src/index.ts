@@ -104,22 +104,31 @@ const agentFactory = makeAgentFactory({ supervisor, skills });
 
 /** sid → request id of the in-flight prompt, if any. Used to tag events. */
 const currentPromptId = new Map<string, string>();
+/** sid → unsubscribe fn returned by Agent.subscribe; called on dispose so the
+ *  contract is explicit rather than relying on GC after registry eviction. */
+const unsubscribers = new Map<string, () => void>();
 
 const registry = new SessionRegistry<Agent>({
   agentFactory: (sid) => {
     const agent = agentFactory(sid);
     // Subscribe each Agent's events at creation time. The listener captures
     // the sid in closure; pi never changes a Session's sid post-construction.
-    agent.subscribe((event: AgentEvent) => {
+    const unsubscribe = agent.subscribe((event: AgentEvent) => {
       // We don't have the per-prompt request id here. The sidecar correlates
       // by sid; the UI keys events by sid in atoms. The id field is filled
       // when the prompt was issued (see runChat below).
       const reqId = currentPromptId.get(sid) ?? null;
       write({ sessionId: sid, id: reqId, kind: "agent_event", event });
     });
+    unsubscribers.set(sid, unsubscribe);
     return agent;
   },
   onDispose: (sid) => {
+    const unsub = unsubscribers.get(sid);
+    if (unsub) {
+      try { unsub(); } catch { /* best-effort */ }
+      unsubscribers.delete(sid);
+    }
     currentPromptId.delete(sid);
   },
 });
