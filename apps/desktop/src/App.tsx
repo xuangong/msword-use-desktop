@@ -351,7 +351,7 @@ export default function App() {
         text: line,
       });
       setPending(true);
-      const payload = { kind: "chat", id, message: line };
+      const payload = { kind: "chat", id, sessionId: sid, message: line };
       try {
         await invoke("bun_send", { line: JSON.stringify(payload) });
         startPollChat(id, sid);
