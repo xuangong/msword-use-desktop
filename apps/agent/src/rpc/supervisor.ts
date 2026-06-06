@@ -46,7 +46,7 @@ export class Supervisor {
       args: [],
       callTimeoutMs: 10_000,
       maxRestartsPerMin: 3,
-      factory: (o) => new DriverClient(o),
+      factory: (o: DriverClientOptions) => new DriverClient(o),
       ...opts,
     } as any;
     this.client = this.opts.factory(this.opts);
