@@ -21,13 +21,13 @@ Tauri 2 (Rust)           (apps/desktop/src-tauri)
         ▲
         │ NDJSON over stdio (sidecar)
         ▼
-Bun agent loop           (apps/agent)
+Bun + pi-agent-core      (apps/agent)
         ▲ Anthropic SDK
         │ NDJSON over stdio (supervised subprocess)
         ▼
 WordDriver.exe (.NET 4.8) (drivers/WordDriver)
         ▲
-        │ COM
+        │ COM (single-action driver: exec_csharp + a thin observe RPC)
         ▼
 Microsoft Word
 ```
@@ -49,7 +49,6 @@ git clone https://github.com/xuangong/msword-use-desktop.git
 cd msword-use-desktop
 
 bun install                # install workspace deps
-bun run gen                # regenerate RPC types from drivers/WordDriver/schema/methods.json
 bun run driver:build       # build the .NET 4.8 Word COM driver
 
 # Export your Anthropic key — required for chat / polish
@@ -72,7 +71,7 @@ document (we ship `gongwen_sample.docx` in the v1 repo as a fixture).
 `驱动 gen=1` in green and the right-side context panel should populate with
 the active document name, current selection, and outline.
 
-### 3. Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Space</kbd>
+### 3. Press <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>J</kbd>
 Global hotkey — works from any app, including from Word itself. Toggles the
 msword-use window in/out of focus.
 
@@ -85,26 +84,13 @@ msword-use window in/out of focus.
   `[AI: polish:公文]` comment
 
 ### 5. Raw RPC for debugging (`/` prefix)
-- `/ping` → `{pong: true}`
-- `/attach` → `{attached: true, version: "16.0", ...}`
-- `/observe.outline` → current document's heading tree
-- `/observe.selection` → current selection state
-- `/observe.paragraph {"index":4}` → read paragraph 4
-- `/_freeze` → simulate a driver hang; ~10s later the supervisor
-  kills + restarts and `gen` jumps to 2
+Slash commands removed in W1; will be re-added if useful.
 
-## Styles
+## Polish styles
 
-The `polish_text` tool accepts five built-in presets (ported from v1):
-
-| preset | use case |
-|---|---|
-| `公文` | Chinese government / institutional documents |
-| `合同` | Contracts and legal writing |
-| `论文` | Academic papers |
-| `文案` | Marketing copy |
-| `商务` | Business correspondence |
-| `custom` | Free-form style description (set via `custom_style`) |
+Polish in 公文 / 合同 / 论文 / 文案 / 商务 style — the agent reads the matching
+SKILL.md from `apps/agent/skills/` and writes a Track-Changes-wrapped C#
+script (via `exec_csharp`) to apply the rewrite.
 
 ## Headless smoke tests (no Tauri window)
 
@@ -116,10 +102,11 @@ bun test --cwd apps/desktop src/state/piEventBridge.test.ts   # frontend bridge 
 
 ## Status
 
-**Alpha (Week 3 of 3 complete).** End-to-end `/polish` over the agent loop
-validated. Built-in observability (CoT stream, tool-call expand, Word
-context panel, supervisor gen tracking). Tauri window tested in dev mode;
-`bun run build` (.msi packaging) is wired up but not yet exercised in CI.
+**Alpha (Week 3) + W1 pi-agent-core rewrite in progress.** End-to-end
+`/polish` over the agent loop validated. Built-in observability (CoT
+stream, tool-call expand, Word context panel, supervisor gen tracking).
+Tauri window tested in dev mode; `bun run build` (.msi packaging) is wired
+up but not yet exercised in CI.
 
 ### Known limitations (alpha)
 - `bun run dev` requires that `ANTHROPIC_API_KEY` is set in the launching shell
