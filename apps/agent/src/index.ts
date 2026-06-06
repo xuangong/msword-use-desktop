@@ -1,38 +1,84 @@
 /**
- * Bun sidecar entry point.
+ * Bun sidecar entry point — pi-agent-core era.
  *
- * Receives NDJSON requests from Tauri on stdin, dispatches to one of:
+ * Stdin protocol (line-delimited JSON from Tauri):
+ *   {"kind":"chat","id":"<reqId>","sessionId":"<sid>","message":"<text>","pinnedTarget":{paragraphIndex,preview}?}
+ *   {"kind":"raw","id":"<reqId>","code":"<C# script>"}
+ *   {"kind":"abort","sessionId":"<sid>"}
+ *   {"kind":"shutdown"}
  *
- *   {"kind":"raw","id":"<str>","method":"<str>","params":{...}}
- *     — pass-through RPC into the WordDriver. Used by the dev UI's
- *       "raw command" mode and by the test harness.
- *
- *   {"kind":"chat","id":"<str>","message":"<str>"}
- *     — runs one agent turn; streams events back as
- *       {"id":"<str>","kind":"agent_event","event":{...}}
- *
- * Old-style requests without `kind` are treated as `raw` for backwards compat
- * with the W1 test harness.
+ * Stdout protocol (line-delimited JSON to Tauri):
+ *   {"ready":true,"driverExe":"...","gen":1}                                       (startup)
+ *   {"sessionId":"<sid>","id":"<reqId>","kind":"agent_event","event":<pi-AgentEvent>}  (per pi event)
+ *   {"id":"<reqId>","kind":"raw_response","result":...,"stdout":"...","error":null}    (per raw)
+ *   {"kind":"driver_restart","from":1,"to":2,"reason":"hang"}                          (supervisor)
  *
  * Concurrency:
- * - chat requests are SERIALIZED through a single FIFO queue. Two near-
- *   simultaneous chat messages would otherwise race on the same Word selection
- *   (e.g. user clicks "send" twice). Raw RPCs stay parallel — they're
- *   independent driver calls.
+ *   - chat requests are SERIALIZED through a single global FIFO chain (per spec Q1)
+ *   - raw and abort run concurrently with the chat chain (they don't touch the
+ *     same Word selection in adversarial ways: raw is for fast snapshots,
+ *     abort is targeted at one session)
  */
 
-import { Supervisor } from "./rpc/supervisor";
-import { runAgentTurn } from "./agent/loop";
-import { friendlyDriverError } from "./agent/errors";
 import { resolve } from "node:path";
+import { Supervisor } from "./rpc/supervisor";
+import { loadSkills } from "@earendil-works/pi-agent-core";
+// NodeExecutionEnv lives only on the /node subpath (not on the package root).
+import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
+import { resolveAllowedRoots } from "./agent/skillsRoot";
+import { makeAgentFactory } from "./agent/agentFactory";
+import { SessionRegistry } from "./agent/sessionRegistry";
+import type { Agent, AgentEvent } from "@earendil-works/pi-agent-core";
 
-const driverExe = process.env.MSWORD_DRIVER_EXE
-  ?? resolve(import.meta.dir, "../../../drivers/WordDriver/bin/Debug/net48/WordDriver.exe");
+// ---------- driver supervisor ----------
+
+const driverExe =
+  process.env.MSWORD_DRIVER_EXE ??
+  resolve(import.meta.dir, "../../../drivers/WordDriver/bin/Debug/net48/WordDriver.exe");
 
 const supervisor = new Supervisor({ exePath: driverExe, callTimeoutMs: 10_000 });
 supervisor.onGenChange = (info) => {
   write({ kind: "driver_restart", from: info.from, to: info.to, reason: info.reason });
 };
+
+// ---------- skills ----------
+
+const roots = resolveAllowedRoots();
+const env = new NodeExecutionEnv({ cwd: resolve(roots.skills, "..") });
+const { skills, diagnostics } = await loadSkills(env, [roots.skills]);
+for (const d of diagnostics) {
+  // Warnings about malformed SKILL.md — surface to stderr so a dev sees them
+  // without polluting the protocol stream.
+  process.stderr.write(`[skills] ${d.code} at ${d.path}: ${d.message}\n`);
+}
+
+// ---------- agent registry ----------
+
+const agentFactory = makeAgentFactory({ supervisor, skills });
+
+/** sid → request id of the in-flight prompt, if any. Used to tag events. */
+const currentPromptId = new Map<string, string>();
+
+const registry = new SessionRegistry<Agent>({
+  agentFactory: (sid) => {
+    const agent = agentFactory(sid);
+    // Subscribe each Agent's events at creation time. The listener captures
+    // the sid in closure; pi never changes a Session's sid post-construction.
+    agent.subscribe((event: AgentEvent) => {
+      // We don't have the per-prompt request id here. The sidecar correlates
+      // by sid; the UI keys events by sid in atoms. The id field is filled
+      // when the prompt was issued (see runChat below).
+      const reqId = currentPromptId.get(sid) ?? null;
+      write({ sessionId: sid, id: reqId, kind: "agent_event", event });
+    });
+    return agent;
+  },
+  onDispose: (sid) => {
+    currentPromptId.delete(sid);
+  },
+});
+
+// ---------- writer ----------
 
 function write(obj: unknown) {
   process.stdout.write(JSON.stringify(obj) + "\n");
@@ -40,21 +86,20 @@ function write(obj: unknown) {
 
 write({ ready: true, driverExe, gen: supervisor.generation });
 
-// Serial chat queue. Each entry runs to completion (all events streamed)
-// before the next starts. Implemented as a promise chain.
+// ---------- chat FIFO ----------
+
 let chatChain: Promise<void> = Promise.resolve();
 
 function enqueueChat(fn: () => Promise<void>): Promise<void> {
-  // Catch errors so a thrown chat doesn't poison the chain for subsequent ones.
   const next = chatChain.then(fn, fn);
   chatChain = next.catch(() => {});
   return next;
 }
 
-// Read NDJSON from stdin.
+// ---------- main loop ----------
+
 let buf = "";
 const decoder = new TextDecoder("utf-8");
-
 for await (const chunk of Bun.stdin.stream()) {
   buf += decoder.decode(chunk, { stream: true });
   let nl: number;
@@ -62,62 +107,120 @@ for await (const chunk of Bun.stdin.stream()) {
     const line = buf.slice(0, nl).trim();
     buf = buf.slice(nl + 1);
     if (!line) continue;
-    // Fire-and-forget — async handler emits its own replies.
     handleLine(line);
   }
 }
 
 function handleLine(line: string) {
   let req: any;
-  try { req = JSON.parse(line); }
-  catch (err) {
-    write({ id: null, error: `parse_error: ${err}` });
+  try {
+    req = JSON.parse(line);
+  } catch (err) {
+    write({ id: null, kind: "error", error: `parse_error: ${err}` });
     return;
   }
 
-  const id = req.id ?? null;
-
-  // chat mode: run an agent turn, stream events.
-  // Serialized: queued behind any in-flight chat.
-  if (req.kind === "chat") {
-    const message = req.message;
-    if (typeof message !== "string") {
-      write({ id, kind: "agent_event", event: { kind: "error", error: "missing message" } });
+  switch (req.kind) {
+    case "chat":
+      void enqueueChat(() => runChat(req));
       return;
-    }
-    enqueueChat(async () => {
-      try {
-        for await (const ev of runAgentTurn(message, supervisor, req.target)) {
-          write({ id, kind: "agent_event", event: ev, gen: supervisor.generation });
-        }
-      } catch (err: any) {
-        write({
-          id,
-          kind: "agent_event",
-          event: { kind: "error", error: String(err?.message ?? err) },
-          gen: supervisor.generation,
-        });
-      }
-    });
-    return;
+    case "raw":
+      void runRaw(req);
+      return;
+    case "abort":
+      runAbort(req);
+      return;
+    case "shutdown":
+      void runShutdown();
+      return;
+    default:
+      write({ id: req.id ?? null, kind: "error", error: `unknown kind: ${req.kind}` });
   }
-
-  // raw mode (default): pass-through into the driver, executed concurrently.
-  void handleRaw(id, req);
 }
 
-async function handleRaw(id: string | null, req: any) {
-  const method = req.method;
-  if (typeof method !== "string") {
-    write({ id, error: "missing method" });
-    return;
-  }
+interface PinnedTarget {
+  paragraphIndex?: number;
+  preview?: string;
+}
+
+interface ChatReq {
+  id: string;
+  sessionId: string;
+  message: string;
+  pinnedTarget?: PinnedTarget;
+}
+
+async function runChat(req: ChatReq) {
+  const { id, sessionId, message, pinnedTarget } = req;
+  const agent = registry.getOrCreate(sessionId);
+  currentPromptId.set(sessionId, id);
+
+  const userText = pinnedTarget?.paragraphIndex
+    ? composePromptWithTarget(message, pinnedTarget)
+    : message;
+
   try {
-    const result = method.startsWith("_")
-      ? await supervisor.callRaw(method, req.params)
-      : await supervisor.call(method, req.params);
-    write({ id, result, error: null, gen: supervisor.generation });
+    await agent.prompt(userText);
   } catch (err: any) {
-    write({ id, result: null, error: friendlyDriverError(err), gen: supervisor.generation });
+    write({
+      sessionId,
+      id,
+      kind: "agent_event",
+      event: { type: "error", error: String(err?.message ?? err) } as any,
+    });
+  } finally {
+    currentPromptId.delete(sessionId);
   }
+}
+
+function composePromptWithTarget(message: string, target: PinnedTarget): string {
+  const lines = ["[当前操作目标]"];
+  if (target.paragraphIndex) lines.push(`段落索引: ${target.paragraphIndex}`);
+  if (target.preview) lines.push(`段落预览: ${target.preview}`);
+  lines.push("");
+  lines.push(message);
+  return lines.join("\n");
+}
+
+interface RawReq {
+  id: string;
+  code: string;
+}
+
+async function runRaw(req: RawReq) {
+  const { id, code } = req;
+  try {
+    const resp = await supervisor.runScript(code);
+    write({
+      id,
+      kind: "raw_response",
+      result: resp.result,
+      stdout: resp.stdout,
+      error: resp.error,
+    });
+  } catch (err: any) {
+    write({
+      id,
+      kind: "raw_response",
+      result: null,
+      stdout: "",
+      error: String(err?.message ?? err),
+    });
+  }
+}
+
+interface AbortReq {
+  sessionId: string;
+}
+
+function runAbort(req: AbortReq) {
+  if (!registry.has(req.sessionId)) return;
+  const agent = registry.getOrCreate(req.sessionId);
+  agent.abort();
+}
+
+async function runShutdown() {
+  registry.disposeAll();
+  await supervisor.shutdown();
+  process.exit(0);
 }
