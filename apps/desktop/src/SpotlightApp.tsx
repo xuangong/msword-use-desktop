@@ -23,6 +23,12 @@ interface SpotlightInvoke {
   trigger_class: string;
   is_word: boolean;
   seq: number;
+  /** 1-based paragraph index for the active Word selection, or null if
+   *  not focused on Word / snapshot fetch failed. */
+  paragraph_index: number | null;
+  /** Up to 80 chars of the active paragraph's text. Empty string when no
+   *  selection / not Word focused. */
+  preview: string;
 }
 
 interface WordSelection {
