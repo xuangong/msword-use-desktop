@@ -21,6 +21,7 @@
     "@earendil-works/pi-ai": "0.78.1",
     "@types/bun": "latest",
     "json-schema-to-typescript": "^15.0.0",
+    "typebox": "1.1.38",
     "typescript": "^5.6.0"
   }
 }
