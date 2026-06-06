@@ -2,12 +2,15 @@
  * Spotlight — the transient always-on-top input window invoked by Ctrl+Alt+J.
  *
  * Lifecycle:
- *   1. Rust hotkey handler captures foreground HWND/PID/title, emits
+ *   1. Rust hotkey handler captures foreground HWND/PID/title + a snapshot of
+ *      the active Word paragraph (paragraph_index + preview), emits
  *      `spotlight:invoke` with that context, then shows + focuses this window.
- *   2. We read the event, render the context strip ("操作 X.docx · 段 N"),
- *      and ask the sidecar for the current Word selection asynchronously.
+ *   2. We read the event and render the context strip ("第 N 段：「...」"). The
+ *      paragraph snapshot from the invoke event is the pinned target — we do
+ *      NOT re-query Word for the selection, since by the time the user types
+ *      and hits Enter the selection may have drifted.
  *   3. User types a command, hits Enter → we send a chat message to the
- *      sidecar tagged with the trigger context.
+ *      sidecar tagged with sessionId and pinnedTarget.
  *   4. Stream events render inline (tiny progress line + final summary).
  *   5. On success, auto-hide after ~600ms; on error or Esc, hide immediately.
  */
@@ -31,15 +34,6 @@ interface SpotlightInvoke {
   preview: string;
 }
 
-interface WordSelection {
-  text: string;
-  start: number;
-  end: number;
-  isEmpty: boolean;
-  paragraphIndex?: number | null;
-  page?: number | null;
-}
-
 type AgentEvent =
   | { kind: "text_delta"; text: string }
   | { kind: "tool_call"; id: string; name: string; input: unknown }
@@ -57,67 +51,19 @@ function dlog(...args: unknown[]) {
 
 export default function SpotlightApp() {
   const [ctx, setCtx] = useState<SpotlightInvoke | null>(null);
-  const [sel, setSel] = useState<WordSelection | null>(null);
   const [input, setInput] = useState("");
   const [phase, setPhase] = useState<Phase>("idle");
   const [statusText, setStatusText] = useState<string>("");
   const [hint, setHint] = useState<string>("");
   const inputRef = useRef<HTMLInputElement>(null);
   const pendingChatId = useRef<string | null>(null);
-  const selRequestId = useRef<string | null>(null);
 
   const reset = useCallback(() => {
     setInput("");
     setPhase("idle");
     setStatusText("");
     setHint("");
-    setSel(null);
     setTimeout(() => inputRef.current?.focus(), 30);
-  }, []);
-
-  const fetchSelection = useCallback(async () => {
-    const id = `sel:${Math.random().toString(36).slice(2, 8)}`;
-    selRequestId.current = id;
-    dlog("fetchSelection", id);
-    try {
-      await invoke("bun_send", {
-        line: JSON.stringify({ id, method: "observe.selection", params: {} }),
-      });
-      // Poll for the cached reply (Tauri 2 listen() unreliable in this webview).
-      const start = Date.now();
-      const tick = async () => {
-        if (selRequestId.current !== id) return;
-        const replies = await invoke<string[]>("spotlight_take_reply", { subscriber: "spotlight", id }).catch(() => [] as string[]);
-        if (replies.length > 0) {
-          try {
-            const msg = JSON.parse(replies[0]!);
-            dlog("polled selection reply", msg);
-            handleSelectionReply(msg);
-          } catch (err) {
-            dlog("parse reply failed", String(err));
-          }
-          return;
-        }
-        if (Date.now() - start < 5000) {
-          setTimeout(tick, 100);
-        } else {
-          dlog("fetchSelection timed out");
-        }
-      };
-      setTimeout(tick, 50);
-    } catch (err) {
-      dlog("fetchSelection invoke failed", String(err));
-    }
-  }, []);
-
-  /** Apply a sidecar reply to the selection state. */
-  const handleSelectionReply = useCallback((msg: any) => {
-    selRequestId.current = null;
-    if (msg.error) {
-      setHint(msg.error);
-    } else if (msg.result) {
-      setSel(msg.result as WordSelection);
-    }
   }, []);
 
   // Register as a reply subscriber so Rust fans out replies to our queue.
@@ -126,7 +72,9 @@ export default function SpotlightApp() {
   }, []);
 
   useEffect(() => {
-    /** Apply a new invocation context: reset state and refetch selection. */
+    /** Apply a new invocation context: reset state. The paragraph snapshot
+     *  (paragraph_index + preview) is part of the invoke payload itself —
+     *  no separate selection fetch needed. */
     const applyInvoke = (payload: SpotlightInvoke) => {
       dlog("applyInvoke", payload);
       setCtx((prev) => {
@@ -136,7 +84,6 @@ export default function SpotlightApp() {
         if (!payload.is_word) {
           setHint(`触发时前台是 ${payload.trigger_class || "(未知)"}，将操作当前活动 Word 文档`);
         }
-        fetchSelection();
         return payload;
       });
     };
@@ -159,16 +106,6 @@ export default function SpotlightApp() {
       try {
         const msg = JSON.parse(e.payload);
         dlog("reply", msg);
-
-        if (msg.id && msg.id === selRequestId.current) {
-          selRequestId.current = null;
-          if (msg.error) {
-            setHint(msg.error);
-          } else if (msg.result) {
-            setSel(msg.result as WordSelection);
-          }
-          return;
-        }
 
         if (msg.kind === "agent_event" && msg.id && msg.id === pendingChatId.current) {
           const ev: AgentEvent = msg.event;
@@ -208,7 +145,7 @@ export default function SpotlightApp() {
       void offInvoke.then((u) => u());
       void offReply.then((u) => u());
     };
-  }, [reset, fetchSelection]);
+  }, [reset]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -238,7 +175,6 @@ export default function SpotlightApp() {
             if (!payload.is_word) {
               setHint(`触发时前台是 ${payload.trigger_class || "(未知)"}，将操作当前活动 Word 文档`);
             }
-            fetchSelection();
             return payload;
           });
         })
@@ -246,7 +182,7 @@ export default function SpotlightApp() {
     };
     document.addEventListener("visibilitychange", onVis);
     return () => document.removeEventListener("visibilitychange", onVis);
-  }, [reset, fetchSelection]);
+  }, [reset]);
 
   // Robustness fallback: Tauri 2 event delivery to the spotlight webview is
   // unreliable in some configurations. Poll the latest invocation every
@@ -265,14 +201,13 @@ export default function SpotlightApp() {
             if (!payload.is_word) {
               setHint(`触发时前台是 ${payload.trigger_class || "(未知)"}，将操作当前活动 Word 文档`);
             }
-            fetchSelection();
             return payload;
           });
         })
         .catch(() => {});
     }, 250);
     return () => clearInterval(t);
-  }, [reset, fetchSelection]);
+  }, [reset]);
 
   async function send() {
     const message = input.trim();
@@ -280,33 +215,34 @@ export default function SpotlightApp() {
     if (phase === "thinking" || phase === "tool") return;
 
     const id = `chat:${Math.random().toString(36).slice(2, 10)}`;
+    // Generate sessionId BEFORE the bun_send so the sidecar tags this chat
+    // with a real sid (not literal "undefined"). The same sid is announced
+    // to the main window so it can group all events from this chat.
+    const sessionId = `s-${Math.random().toString(36).slice(2, 10)}`;
     pendingChatId.current = id;
     setPhase("thinking");
     setStatusText("思考中...");
-    dlog("send chat", { id, message, sel });
+    dlog("send chat", { id, sessionId, message, ctx });
 
-    // Build the chat payload. We pin the user's selection target NOW so the
+    // Build the chat payload. We pin the user's paragraph target NOW so the
     // agent doesn't re-read Application.Selection later (which can drift
     // while the LLM is thinking, the user clicks, focus changes, etc.).
-    const payload: any = { kind: "chat", id, message };
-    if (sel && !sel.isEmpty && sel.paragraphIndex != null) {
-      payload.target = {
-        kind: "range",
-        start: sel.start,
-        end: sel.end,
-        paragraphIndex: sel.paragraphIndex,
-        textPreview: sel.text.slice(0, 120),
+    // The paragraph snapshot was captured by Rust at hotkey time and arrived
+    // via the spotlight:invoke event in `ctx`.
+    const payload: any = { kind: "chat", id, sessionId, message };
+    if (ctx && ctx.paragraph_index != null) {
+      payload.pinnedTarget = {
+        paragraphIndex: ctx.paragraph_index,
+        preview: ctx.preview,
       };
-      dlog("payload includes target", payload.target);
+      dlog("payload includes pinnedTarget", payload.pinnedTarget);
     } else {
-      dlog("no target — sel is empty or missing", { sel });
+      dlog("no pinnedTarget — ctx missing paragraph_index", { ctx });
     }
 
     try {
       await invoke("bun_send", { line: JSON.stringify(payload) });
       // Tell the main window to render the user bubble + start polling.
-      // Generate a sessionId so main can group all events from this chat.
-      const sessionId = `s-${Math.random().toString(36).slice(2, 10)}`;
       await invoke("announce_chat", { id, message, sessionId }).catch(() => {});
     } catch (err) {
       setPhase("error");
@@ -385,7 +321,7 @@ export default function SpotlightApp() {
   }, []);
 
   const docName = filenameOf(ctx?.trigger_title ?? "");
-  const noSelection = !sel || sel.isEmpty;
+  const noSelection = !ctx || ctx.paragraph_index == null;
   const showHintLine = !!hint || noSelection;
 
   return (
@@ -438,16 +374,18 @@ export default function SpotlightApp() {
                 </span>
               </>
             )}
-            {sel && !sel.isEmpty && (
+            {ctx && ctx.paragraph_index != null && (
               <>
                 <span className="text-neutral-300">·</span>
-                <span>
-                  段 {sel.paragraphIndex ?? "?"} · {sel.end - sel.start} 字
-                </span>
-                <span className="text-neutral-300">·</span>
-                <span className="italic text-neutral-500 truncate max-w-[260px]">
-                  "{sel.text.trim().slice(0, 40)}"
-                </span>
+                <span>段 {ctx.paragraph_index}</span>
+                {ctx.preview && (
+                  <>
+                    <span className="text-neutral-300">·</span>
+                    <span className="italic text-neutral-500 truncate max-w-[260px]">
+                      "{ctx.preview.trim().slice(0, 40)}"
+                    </span>
+                  </>
+                )}
               </>
             )}
             {showHintLine && (
