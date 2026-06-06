@@ -11,8 +11,18 @@
  * errors surface at startup rather than when the LLM first calls read.
  */
 
+/**
+ * Note on symlinks (W1 deferral):
+ * `realpathSync` canonicalises the root paths once at startup, but child
+ * paths from the read tool are resolved lexically (not through realpath).
+ * A symlink under skills/ pointing outside is therefore not blocked by the
+ * isUnder() check. This is acceptable for W1 because the skills bundle is
+ * dev-controlled — no user uploads. Revisit when adding a "skill packs"
+ * feature that lets users add their own SKILL.md content.
+ */
+
 import { existsSync, realpathSync } from "node:fs";
-import { resolve, dirname } from "node:path";
+import { resolve } from "node:path";
 
 export interface AllowedRoots {
   /** Absolute, real (symlink-resolved) path. Trailing separator preserved on Windows by realpathSync. */

@@ -54,13 +54,10 @@ export const readTool: AgentTool<typeof ReadParams, ReadDetails | null> = {
       return errorResult("path must be a non-empty string");
     }
 
-    let roots;
-    try {
-      roots = resolveAllowedRoots();
-    } catch (err) {
-      // Infra failure — throwing surfaces it as a tool failure to pi.
-      throw err;
-    }
+    // Infra failure (skills/docs root not found) propagates to pi as a tool
+    // failure. Per AgentTool contract: throw on infra; return errorResult on
+    // protocol-level errors.
+    const roots = resolveAllowedRoots();
 
     // Resolve relative paths against the parent of both roots (i.e. apps/agent)
     // so requests like "skills/polish-gongwen/SKILL.md" work naturally.
