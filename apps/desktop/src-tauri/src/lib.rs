@@ -34,6 +34,39 @@ static SIDECAR_GEN: Mutex<u32> = Mutex::new(0);
 static SIDECAR_REPLIES: Lazy<Mutex<HashMap<String, HashMap<String, Vec<String>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// C# snippet sent to the driver (via sidecar `kind:"raw"`) to capture the
+/// active paragraph + an 80-char preview when the spotlight hotkey fires.
+///
+/// Globals available (set up by drivers/WordDriver/Roslyn/Host.cs):
+///   - Doc (Word.Document)
+///   - App (Word.Application)
+///
+/// Returns:
+///   { paragraphIndex: int|null, preview: string }
+///
+/// Tolerant of "no selection" (returns null index + empty preview).
+const SNAPSHOT_SCRIPT: &str = r#"
+if (App == null || Doc == null) {
+    return new { paragraphIndex = (int?)null, preview = "" };
+}
+var sel = App.Selection;
+int? idx = null;
+if (sel != null && sel.Paragraphs.Count > 0) {
+    int targetStart = sel.Paragraphs[1].Range.Start;
+    int i = 1;
+    foreach (Microsoft.Office.Interop.Word.Paragraph p in Doc.Paragraphs) {
+        if (p.Range.Start == targetStart) { idx = i; break; }
+        i++;
+    }
+}
+string preview = "";
+if (idx.HasValue) {
+    var t = (Doc.Paragraphs[idx.Value].Range.Text ?? "").Trim('\r','\n','\x07',' ','\t');
+    preview = t.Length > 80 ? t.Substring(0, 80) : t;
+}
+return new { paragraphIndex = idx, preview = preview };
+"#;
+
 fn ensure_subscriber(name: &str) {
     if let Ok(mut top) = SIDECAR_REPLIES.lock() {
         top.entry(name.to_string()).or_insert_with(HashMap::new);
