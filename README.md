@@ -109,8 +109,9 @@ The `polish_text` tool accepts five built-in presets (ported from v1):
 ## Headless smoke tests (no Tauri window)
 
 ```bash
-bun run scripts/test-sidecar.ts   # raw RPC + hang/restart cycle (week 1)
-bun run scripts/test-chat.ts      # full agent loop with polish_text (week 2/3)
+bun run scripts/test-driver.ts    # 6-tick driver smoke (compile/runtime/stdout/empty/shutdown)
+bun test apps/agent               # full sidecar suite (RPC, supervisor, agent, tools)
+bun test --cwd apps/desktop src/state/piEventBridge.test.ts   # frontend bridge tests
 ```
 
 ## Status
