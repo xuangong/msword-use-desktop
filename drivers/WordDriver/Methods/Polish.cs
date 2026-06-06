@@ -19,7 +19,7 @@ namespace MswordUse.WordDriver.Methods
             bool track = p["track"]?.ToObject<bool?>() ?? true;
 
             string original = rng.Text ?? "";
-            using (new RevisionScope(doc, track))
+            using (new RevisionScopeLegacy(doc, track))
             {
                 rng.Text = newText;
             }
@@ -86,13 +86,13 @@ namespace MswordUse.WordDriver.Methods
     /// the previous value on dispose. Use:
     ///   using (new RevisionScope(doc, true)) { rng.Text = newText; }
     /// </summary>
-    sealed class RevisionScope : IDisposable
+    sealed class RevisionScopeLegacy : IDisposable
     {
         readonly Word.Document _doc;
         readonly bool _prev;
         readonly bool _enabled;
 
-        public RevisionScope(Word.Document doc, bool enabled)
+        public RevisionScopeLegacy(Word.Document doc, bool enabled)
         {
             _doc = doc;
             _prev = _doc.TrackRevisions;
