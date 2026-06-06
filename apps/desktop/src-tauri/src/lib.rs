@@ -121,6 +121,11 @@ struct SpotlightInvoke {
     /// Monotonic counter so the UI can detect "this is a new invocation"
     /// even if all other fields are identical.
     seq: u64,
+    /// 1-based paragraph index for the current Word selection. None if Word
+    /// isn't focused or the snapshot fetch failed.
+    paragraph_index: Option<u32>,
+    /// Up to 80 chars of the active paragraph's text. Empty when no selection.
+    preview: String,
 }
 
 #[cfg(windows)]
@@ -153,6 +158,8 @@ fn capture_foreground() -> SpotlightInvoke {
             trigger_class: class,
             is_word,
             seq,
+            paragraph_index: None,
+            preview: String::new(),
         }
     }
 }
@@ -166,6 +173,8 @@ fn capture_foreground() -> SpotlightInvoke {
         trigger_class: String::new(),
         is_word: false,
         seq: 0,
+        paragraph_index: None,
+        preview: String::new(),
     }
 }
 
@@ -243,11 +252,20 @@ fn spotlight_take_reply(subscriber: Option<String>, id: String) -> Vec<String> {
 }
 
 fn show_spotlight(app: &AppHandle) {
-    let invoke = capture_foreground();
+    let mut invoke = capture_foreground();
     eprintln!(
         "[main] spotlight invoke: seq={} class={:?} title={:?} is_word={} hwnd={:#x} pid={}",
         invoke.seq, invoke.trigger_class, invoke.trigger_title, invoke.is_word, invoke.trigger_hwnd, invoke.trigger_pid,
     );
+
+    // Snapshot fetch: only worth attempting if the foreground is actually Word.
+    // Otherwise we'd spend 2s waiting for a script that's guaranteed to error.
+    if invoke.is_word {
+        let snap = fetch_snapshot_blocking(invoke.seq);
+        invoke.paragraph_index = snap.paragraph_index;
+        invoke.preview = snap.preview;
+    }
+
     if let Ok(mut g) = LAST_INVOKE.lock() {
         *g = Some(invoke.clone());
     }
@@ -255,8 +273,6 @@ fn show_spotlight(app: &AppHandle) {
         let _ = w.show();
         let _ = w.set_always_on_top(true);
         let _ = w.set_focus();
-        // Tauri 2: emit_to a specific webview is more reliable than the
-        // host-side w.emit which can land on the host event channel.
         if let Err(e) = app.emit_to(EventTarget::webview_window("spotlight"), "spotlight:invoke", invoke) {
             eprintln!("[main] spotlight:invoke emit_to failed: {}", e);
         }
