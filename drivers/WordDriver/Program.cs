@@ -7,13 +7,17 @@ using Newtonsoft.Json.Linq;
 namespace MswordUse.WordDriver
 {
     /// <summary>
-    /// JSON-RPC entry point: reads NDJSON requests from stdin, dispatches to
-    /// method handlers, writes JSON results to stdout. One line per message.
+    /// Driver main loop.
     ///
-    /// Wire format:
-    ///   request : {"id":"<str>","method":"<str>","params":{...}}
-    ///   response: {"id":"<str>","result":{...},"error":null}
-    ///   error   : {"id":"<str>","result":null,"error":"<msg>"}
+    /// Wire format: line-delimited JSON (LF terminator).
+    ///   request:  {"id":"<str>","code":"<C# script>"}
+    ///   response: {"id":"<str>","result":<json>,"stdout":"<str>","error":null}
+    ///   error:    {"id":"<str>","result":null,"stdout":"<str>","error":"<msg>"}
+    ///
+    /// Special inputs:
+    ///   {"id":"x","code":"_freeze"}  — hidden test trigger: blocks forever so the
+    ///                                   sidecar supervisor can verify timeout+respawn.
+    ///   {"id":"x","code":"_shutdown"} — cooperative shutdown; returns then exits.
     /// </summary>
     static class Program
     {
@@ -34,79 +38,46 @@ namespace MswordUse.WordDriver
                 try { req = JObject.Parse(line); }
                 catch (Exception ex)
                 {
-                    WriteResponse(null, null, "parse_error: " + ex.Message);
+                    WriteResponse(null, null, "", "parse_error: " + ex.Message);
                     continue;
                 }
 
                 var id = req["id"]?.ToString();
-                var method = req["method"]?.ToString();
-                var paramsObj = req["params"] as JObject ?? new JObject();
+                var code = req["code"]?.ToString() ?? "";
+
+                // Test/shutdown pseudo-codes (kept verbatim from v0.3 for the
+                // existing supervisor hang test).
+                if (code == "_freeze")
+                {
+                    while (true) System.Threading.Thread.Sleep(1000);
+                }
+                if (code == "_shutdown")
+                {
+                    WriteResponse(id, new { bye = true }, "", null);
+                    return 0;
+                }
 
                 try
                 {
-                    object result = Dispatch(method, paramsObj);
-                    WriteResponse(id, result, null);
+                    var er = Roslyn.Host.Run(code);
+                    WriteResponse(id, er.Result, er.Stdout ?? "", er.Error);
                 }
                 catch (Exception ex)
                 {
-                    WriteResponse(id, null, ex.GetType().Name + ": " + ex.Message);
-                }
-
-                // P0-12: shutdown writes its response above via the normal
-                // path, then exits AFTER the write completes. The previous
-                // version wrote twice (once in Dispatch, once here).
-                if (method == "shutdown")
-                {
-                    return 0;
+                    WriteResponse(id, null, "", "host_error: " + ex.GetType().Name + ": " + ex.Message);
                 }
             }
             return 0;
         }
 
-        static object Dispatch(string method, JObject p)
-        {
-            switch (method)
-            {
-                case "ping":
-                    return new { pong = true };
-
-                // Hidden test method (not in schema): simulate a hang so the
-                // supervisor can verify timeout + kill+respawn end-to-end.
-                case "_freeze":
-                    while (true) System.Threading.Thread.Sleep(1000);
-
-                case "attach":
-                    return WordSession.Attach();
-
-                case "observe.selection":
-                    return Methods.Observe.Selection();
-                case "observe.outline":
-                    return Methods.Observe.Outline(p["maxLevel"]?.ToObject<int?>() ?? 3);
-                case "observe.paragraph":
-                    return Methods.Observe.Paragraph(p["index"].ToObject<int>());
-
-                case "polish.replaceRange":
-                    return Methods.Polish.ReplaceRange(p);
-                case "polish.addComment":
-                    return Methods.Polish.AddComment(p);
-
-                case "shutdown":
-                    // Return cleanly; the main loop writes our response then
-                    // exits the while-loop because of method == "shutdown".
-                    return new { bye = true };
-
-                default:
-                    throw new Exception("unknown method: " + method);
-            }
-        }
-
-        static void WriteResponse(string id, object result, string error)
+        static void WriteResponse(string id, object result, string stdout, string error)
         {
             var resp = new
             {
                 id = id,
                 result = error == null ? result : null,
-                error = error
+                stdout = stdout ?? "",
+                error = error,
             };
             Console.Out.WriteLine(JsonConvert.SerializeObject(resp));
             Console.Out.Flush();
