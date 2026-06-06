@@ -31,22 +31,11 @@ import {
   sessionIdsAtom,
   setWordCtxAtom,
 } from "./state/atoms";
+import { piEventToDebugEvent } from "./state/piEventBridge";
 import type { ChatTurn, DebugEvent, DebugEventKind, ToolCall, WordContextSnapshot } from "./state/types";
 
 function rid(): string {
   return Math.random().toString(36).slice(2, 10);
-}
-
-interface AgentEventInner {
-  kind: "text_delta" | "tool_call" | "tool_result" | "done" | "error" | "llm_request" | "llm_response";
-  text?: string;
-  id?: string;
-  name?: string;
-  input?: unknown;
-  result?: unknown;
-  stopReason?: string | null;
-  error?: string;
-  payload?: any;
 }
 
 export default function App() {
@@ -158,7 +147,12 @@ export default function App() {
   }, []);
 
   function handleSidecarReply(msg: any) {
-    const sid = (msg.id && idToSession.current.get(msg.id)) ?? currentSessionId ?? "global";
+    // Prefer sessionId carried in the envelope (pi-shaped events). Fall back
+    // to the legacy idToSession map for v0.3-style replies that didn't carry
+    // sessionId. Phase 7 cleanup will assess removing the map.
+    const envSid: string | undefined = typeof msg.sessionId === "string" ? msg.sessionId : undefined;
+    const sid =
+      envSid ?? (msg.id && idToSession.current.get(msg.id)) ?? currentSessionId ?? "global";
 
     if (msg.ready) {
       setDriverReady(true);
@@ -180,19 +174,63 @@ export default function App() {
         ts: Date.now(),
         sessionId: sid,
         kind: "system",
-        text: `⚠️ 驱动重启 gen ${msg.from} → ${msg.to}（${msg.reason ?? "?"}）`,
+        text: `⚠️ 驱动重启 gen ${msg.from} → ${msg.to}(${msg.reason ?? "?"})`,
         severity: "warn",
       });
       return;
     }
     if (msg.gen != null) setDriverGen(msg.gen);
 
+    // pi-shaped agent event envelope: {sessionId, id, kind:"agent_event", event:<piEvent>}
     if (msg.kind === "agent_event" && msg.event) {
-      ingestAgentEvent(msg.id ?? "", msg.event, sid);
+      const reqId: string | null = typeof msg.id === "string" ? msg.id : null;
+      const debugEv = piEventToDebugEvent(
+        { sessionId: sid, id: reqId, kind: "agent_event", event: msg.event },
+        { reqId },
+      );
+      if (debugEv) {
+        appendEvent(debugEv);
+        // Mark turn as no-longer-pending when we see a terminal event.
+        if (debugEv.kind === "done" || debugEv.kind === "error") {
+          setPending(false);
+        }
+        // Side effects for tool_call inputs and tool_result previews —
+        // preserved from the v0.3 ingest path because the spotlight UI relies
+        // on the Word context strip being kept in sync.
+        if (debugEv.kind === "tool_call") {
+          const inp: any = debugEv.input;
+          if (inp && typeof inp === "object") {
+            const patch: Partial<WordContextSnapshot> = {};
+            if (typeof inp.paragraph_index === "number") {
+              patch.paragraphIndex = inp.paragraph_index;
+            }
+            if (Object.keys(patch).length > 0) {
+              setWordCtx({ sessionId: sid, patch });
+            }
+          }
+        } else if (debugEv.kind === "tool_result") {
+          const r: any = debugEv.result;
+          if (r && typeof r === "object" && r.preview_original) {
+            setWordCtx({
+              sessionId: sid,
+              patch: {
+                selectionText: r.preview_original,
+                paragraphIndex: r.paragraph_index ?? null,
+              },
+            });
+          }
+        }
+      }
       return;
     }
 
-    // Driver RPC reply (raw)
+    // Raw response (sidecar broadcasts driver RPC results). The spotlight
+    // window consumes its own raw replies; main window can ignore.
+    if (msg.kind === "raw_response") {
+      return;
+    }
+
+    // Driver RPC reply (raw) — kept for `/<method>` slash-command flow.
     if (msg.id && msg.result != null) {
       appendEvent({
         id: rid(),
@@ -211,94 +249,6 @@ export default function App() {
         kind: "driver_recv",
         requestId: msg.id,
         error: msg.error,
-      });
-    }
-  }
-
-  function ingestAgentEvent(chatId: string, ev: AgentEventInner, sid: string) {
-    const base = {
-      id: rid(),
-      ts: Date.now(),
-      sessionId: sid,
-      messageId: chatId,
-    };
-    if (ev.kind === "text_delta") {
-      appendEvent({ ...base, kind: "text_delta", text: ev.text ?? "" });
-    } else if (ev.kind === "tool_call") {
-      appendEvent({
-        ...base,
-        kind: "tool_call",
-        toolUseId: ev.id ?? rid(),
-        name: ev.name ?? "(unknown)",
-        input: ev.input,
-      });
-      // Side effect: if the tool call carries selection info, update the
-      // session's Word context. polish_text's input has paragraph_index
-      // when target='paragraph'; pinnedRange (set by spotlight) has start/end.
-      const inp: any = ev.input;
-      if (inp && typeof inp === "object") {
-        const patch: Partial<WordContextSnapshot> = {};
-        if (typeof inp.paragraph_index === "number") {
-          patch.paragraphIndex = inp.paragraph_index;
-        }
-        if (Object.keys(patch).length > 0) {
-          setWordCtx({ sessionId: sid, patch });
-        }
-      }
-    } else if (ev.kind === "tool_result") {
-      const ok = (ev.result as any)?.ok !== false;
-      appendEvent({
-        ...base,
-        kind: "tool_result",
-        toolUseId: ev.id ?? "",
-        name: ev.name ?? "",
-        result: ev.result,
-        ok,
-      });
-      // Surface "what got operated on" into the session's Word context so the
-      // header strip can show "段 5 · 一、培训目标" even mid-chat.
-      const r: any = ev.result;
-      if (r && typeof r === "object" && r.preview_original) {
-        setWordCtx({
-          sessionId: sid,
-          patch: {
-            selectionText: r.preview_original,
-            paragraphIndex: r.paragraph_index ?? null,
-          },
-        });
-      }
-    } else if (ev.kind === "done") {
-      appendEvent({
-        ...base,
-        kind: "done",
-        stopReason: ev.stopReason ?? null,
-        finalText: typeof (ev as any).text === "string" ? (ev as any).text : "",
-      });
-      setPending(false);
-    } else if (ev.kind === "error") {
-      appendEvent({ ...base, kind: "error", error: ev.error ?? "(unknown)" });
-      setPending(false);
-    } else if (ev.kind === "llm_request") {
-      const p = ev.payload ?? {};
-      appendEvent({
-        ...base,
-        kind: "llm_request",
-        model: p.model ?? "",
-        system: p.system ?? "",
-        messages: p.messages,
-        tools: p.tools,
-        cacheSystem: !!p.cacheSystem,
-        maxTokens: p.maxTokens ?? 0,
-      });
-    } else if (ev.kind === "llm_response") {
-      const p = ev.payload ?? {};
-      appendEvent({
-        ...base,
-        kind: "llm_response",
-        stopReason: p.stopReason ?? null,
-        text: p.text ?? "",
-        toolUses: p.toolUses,
-        usage: p.usage,
       });
     }
   }
@@ -322,8 +272,13 @@ export default function App() {
           // Make sure session lookup works.
           if (msg.id) idToSession.current.set(msg.id, sid);
           handleSidecarReply(msg);
-          if (msg.kind === "agent_event" && (msg.event?.kind === "done" || msg.event?.kind === "error")) {
-            done = true;
+          // Pi-shaped events use `event.type`; v0.3 used `event.kind`. Accept both
+          // for resilience while the bridge phase settles.
+          if (msg.kind === "agent_event") {
+            const t = msg.event?.type ?? msg.event?.kind;
+            if (t === "agent_end" || t === "error" || t === "done") {
+              done = true;
+            }
           }
         } catch { /* ignore */ }
       }
