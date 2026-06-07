@@ -4,14 +4,22 @@
  * Single source of truth for LLM-runtime configuration: API key, base URL,
  * model id, gateway-compat tweaks. Replaces ad-hoc environment variables.
  *
- * Resolution order (first hit wins):
- *   1. env MSWORD_CONFIG_PATH (dev override / tests)
- *   2. %APPDATA%/msword-use/config.json on Windows
- *      $XDG_CONFIG_HOME/msword-use/config.json on Unix (XDG_CONFIG_HOME or ~/.config)
- *      ~/Library/Application Support/msword-use/config.json on macOS
+ * Also defines the **data directory** layout on disk:
  *
- * If the file is missing, returns an empty config — defaults take over and
- * the agent will throw at first prompt with a clear "no API key" error.
+ *   <dataDir>/
+ *   ├── config.json    ← runtime config
+ *   ├── skills/        ← user-editable SKILL.md tree (seeded from bundle)
+ *   └── docs/          ← reference material readable by the read tool
+ *
+ * dataDir resolution order (first hit wins):
+ *   1. env MSWORD_DATA_DIR (dev override / tests / portable installs)
+ *   2. %APPDATA%/msword-use/ on Windows
+ *      ~/Library/Application Support/msword-use/ on macOS
+ *      $XDG_CONFIG_HOME/msword-use/ on Linux (or ~/.config/msword-use/)
+ *
+ * config.json path can be overridden independently with MSWORD_CONFIG_PATH
+ * (kept for back-compat — points to a config file not necessarily under
+ * dataDir, e.g. tests).
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -34,27 +42,43 @@ export interface MswordUseConfig {
   disableThinkingField?: boolean;
 }
 
-/** Where the config file would live on this OS, regardless of whether it exists. */
-export function defaultConfigPath(): string {
+/** OS-standard application data dir for msword-use. */
+export function defaultDataDir(): string {
+  const override = process.env.MSWORD_DATA_DIR?.trim();
+  if (override) return resolve(override);
+
   if (process.platform === "win32") {
     const appdata = process.env.APPDATA;
-    if (appdata) return join(appdata, "msword-use", "config.json");
-    return join(homedir(), "AppData", "Roaming", "msword-use", "config.json");
+    if (appdata) return join(appdata, "msword-use");
+    return join(homedir(), "AppData", "Roaming", "msword-use");
   }
   if (process.platform === "darwin") {
-    return join(homedir(), "Library", "Application Support", "msword-use", "config.json");
+    return join(homedir(), "Library", "Application Support", "msword-use");
   }
   // Linux / other Unix
   const xdg = process.env.XDG_CONFIG_HOME;
-  return xdg
-    ? join(xdg, "msword-use", "config.json")
-    : join(homedir(), ".config", "msword-use", "config.json");
+  return xdg ? join(xdg, "msword-use") : join(homedir(), ".config", "msword-use");
+}
+
+/** Where the config file lives. */
+export function defaultConfigPath(): string {
+  return join(defaultDataDir(), "config.json");
 }
 
 /** Resolve the config path, honouring MSWORD_CONFIG_PATH override. */
 export function resolveConfigPath(): string {
   const override = process.env.MSWORD_CONFIG_PATH?.trim();
   return override ? resolve(override) : defaultConfigPath();
+}
+
+/** User-editable skills directory under dataDir. Seeded from bundle on startup. */
+export function userSkillsDir(): string {
+  return join(defaultDataDir(), "skills");
+}
+
+/** User-editable docs directory under dataDir. Empty by default. */
+export function userDocsDir(): string {
+  return join(defaultDataDir(), "docs");
 }
 
 let _cached: { path: string; config: MswordUseConfig } | null = null;

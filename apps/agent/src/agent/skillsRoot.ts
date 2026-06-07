@@ -1,33 +1,32 @@
 /**
  * Resolves the absolute paths of the two directories the `read` tool is
- * allowed to access.
+ * allowed to access. Both live under the user-data dir (~/.config/msword-use/
+ * or %APPDATA%/msword-use/ etc — see lib/config.ts) and are seeded from the
+ * bundle at startup.
  *
  * Resolution order (first hit wins):
- *   1. env var MSWORD_AGENT_SKILLS_ROOT — set by Tauri or by tests
- *   2. <import.meta.dir>/../../skills (works in `bun run dev` from apps/agent)
- *   3. cwd/apps/agent/skills (works when sidecar is run from repo root)
+ *   1. MSWORD_AGENT_SKILLS_ROOT / MSWORD_AGENT_DOCS_ROOT (tests / dev override)
+ *   2. <dataDir>/skills, <dataDir>/docs (the production location)
  *
- * Throws on construction if neither default location exists, so configuration
+ * Throws if the user-data dir doesn't exist after seeding — configuration
  * errors surface at startup rather than when the LLM first calls read.
- */
-
-/**
- * Note on symlinks (W1 deferral):
- * `realpathSync` canonicalises the root paths once at startup, but child
- * paths from the read tool are resolved lexically (not through realpath).
- * A symlink under skills/ pointing outside is therefore not blocked by the
- * isUnder() check. This is acceptable for W1 because the skills bundle is
- * dev-controlled — no user uploads. Revisit when adding a "skill packs"
- * feature that lets users add their own SKILL.md content.
+ *
+ * Note on symlinks (W1 deferral): realpathSync canonicalises the root paths
+ * once at startup, but child paths from the read tool are resolved lexically
+ * (not through realpath). A symlink under skills/ pointing outside is
+ * therefore not blocked by the isUnder() check. Acceptable while the skills
+ * tree is seeded from the dev-controlled bundle. Revisit when "skill packs"
+ * (user-uploaded skills) become a thing.
  */
 
 import { existsSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
+import { userSkillsDir, userDocsDir } from "../lib/config";
 
 export interface AllowedRoots {
-  /** Absolute, real (symlink-resolved) path. Trailing separator preserved on Windows by realpathSync. */
+  /** Absolute, real (symlink-resolved) path to the user skills dir. */
   skills: string;
-  /** Absolute, real path. */
+  /** Absolute, real path to the user docs dir. */
   docs: string;
 }
 
@@ -50,28 +49,17 @@ function pickRoot(envVar: string, candidates: string[]): string | null {
 export function resolveAllowedRoots(): AllowedRoots {
   if (cached) return cached;
 
-  // import.meta.dir = apps/agent/src/agent in dev
-  // (bun --compile inlines this to the original path at build time)
-  const here = import.meta.dir;
-  const appAgentDir = resolve(here, "..", ".."); // apps/agent/
-
-  const skills = pickRoot("MSWORD_AGENT_SKILLS_ROOT", [
-    resolve(appAgentDir, "skills"),
-    resolve(process.cwd(), "apps/agent/skills"),
-  ]);
+  const skills = pickRoot("MSWORD_AGENT_SKILLS_ROOT", [userSkillsDir()]);
   if (!skills) {
     throw new Error(
-      "skills root not found — set MSWORD_AGENT_SKILLS_ROOT or run sidecar with apps/agent/skills reachable",
+      `skills root not found at ${userSkillsDir()} — sidecar should have seeded it from the bundle. Did skill seeding fail?`,
     );
   }
 
-  const docs = pickRoot("MSWORD_AGENT_DOCS_ROOT", [
-    resolve(appAgentDir, "docs"),
-    resolve(process.cwd(), "apps/agent/docs"),
-  ]);
+  const docs = pickRoot("MSWORD_AGENT_DOCS_ROOT", [userDocsDir()]);
   if (!docs) {
     throw new Error(
-      "docs root not found — set MSWORD_AGENT_DOCS_ROOT or run sidecar with apps/agent/docs reachable",
+      `docs root not found at ${userDocsDir()} — sidecar should have seeded it from the bundle. Did skill seeding fail?`,
     );
   }
 

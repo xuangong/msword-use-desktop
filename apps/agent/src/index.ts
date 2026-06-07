@@ -29,6 +29,7 @@ import { resolveAllowedRoots } from "./agent/skillsRoot";
 import { makeAgentFactory } from "./agent/agentFactory";
 import { SessionRegistry } from "./agent/sessionRegistry";
 import { loadConfig } from "./lib/config";
+import { seedUserData } from "./lib/seedUserData";
 import type { Agent, AgentEvent } from "@earendil-works/pi-agent-core";
 
 // ---------- Windows path-normalization wrapper for pi's NodeExecutionEnv ----------
@@ -89,6 +90,11 @@ supervisor.onGenChange = (info) => {
 };
 
 // ---------- skills ----------
+
+// Seed bundle skills/ + docs/ into the user data dir on every startup
+// (idempotent; never overwrites user edits). Resolution order in
+// skillsRoot.ts then picks the seeded user dir.
+seedUserData();
 
 const roots = resolveAllowedRoots();
 const env = new PosixNodeExecutionEnv({ cwd: resolve(roots.skills, "..") });

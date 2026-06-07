@@ -1,8 +1,27 @@
-import { test, expect, beforeEach } from "bun:test";
+import { test, expect, beforeEach, afterAll } from "bun:test";
+import { resolve } from "node:path";
 import { readTool } from "./read";
 import { __resetAllowedRootsForTesting } from "../skillsRoot";
 
+// Tests target the bundle directly (apps/agent/skills) instead of the
+// user data dir, so we don't depend on the seeding side-effect and don't
+// pollute the developer's real %APPDATA%/msword-use during test runs.
+const BUNDLE_SKILLS = resolve(import.meta.dir, "..", "..", "..", "skills");
+const BUNDLE_DOCS = resolve(import.meta.dir, "..", "..", "..", "docs");
+const ORIG_SKILLS = process.env.MSWORD_AGENT_SKILLS_ROOT;
+const ORIG_DOCS = process.env.MSWORD_AGENT_DOCS_ROOT;
+
 beforeEach(() => {
+  process.env.MSWORD_AGENT_SKILLS_ROOT = BUNDLE_SKILLS;
+  process.env.MSWORD_AGENT_DOCS_ROOT = BUNDLE_DOCS;
+  __resetAllowedRootsForTesting();
+});
+
+afterAll(() => {
+  if (ORIG_SKILLS === undefined) delete process.env.MSWORD_AGENT_SKILLS_ROOT;
+  else process.env.MSWORD_AGENT_SKILLS_ROOT = ORIG_SKILLS;
+  if (ORIG_DOCS === undefined) delete process.env.MSWORD_AGENT_DOCS_ROOT;
+  else process.env.MSWORD_AGENT_DOCS_ROOT = ORIG_DOCS;
   __resetAllowedRootsForTesting();
 });
 
