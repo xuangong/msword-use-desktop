@@ -271,9 +271,14 @@ export default function App() {
       for (const raw of replies) {
         try {
           const msg = JSON.parse(raw);
-          // Make sure session lookup works.
+          // Maintain id→session lookup so the bun:reply listener (which is the
+          // SOLE event-dispatch path) can resolve sessionId. Do NOT call
+          // handleSidecarReply here — the listener already did that. Calling it
+          // a second time would double-append every text_delta. The polling
+          // path exists ONLY to drain this subscriber queue (otherwise it grows
+          // unbounded) and to detect the agent_end / error stop signal so we
+          // can flip `pending` off and clean up.
           if (msg.id) idToSession.current.set(msg.id, sid);
-          handleSidecarReply(msg);
           // Pi-shaped events use `event.type`; v0.3 used `event.kind`. Accept both
           // for resilience while the bridge phase settles.
           if (msg.kind === "agent_event") {
@@ -288,6 +293,7 @@ export default function App() {
         setTimeout(tick, 100);
       } else {
         polledIds.current.delete(chatId);
+        setPending(false);
       }
     };
     setTimeout(tick, 50);
