@@ -20,6 +20,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { JsonView, defaultStyles } from "react-json-view-lite";
 import "react-json-view-lite/dist/index.css";
+import Markdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import "./App.css";
 import {
   appendEventAtom,
@@ -500,8 +502,10 @@ function TurnView({ turn }: { turn: ChatTurn }) {
 
       {(turn.assistantText || turn.streaming) && (
         <div className="flex justify-start">
-          <div className="max-w-[85%] bg-white border border-neutral-200 rounded-2xl rounded-tl-sm px-4 py-2 text-sm whitespace-pre-wrap break-words">
-            {turn.assistantText || <span className="text-neutral-400">...</span>}
+          <div className="max-w-[85%] bg-white border border-neutral-200 rounded-2xl rounded-tl-sm px-4 py-2 text-sm break-words assistant-md">
+            {turn.assistantText
+              ? <Markdown remarkPlugins={[remarkGfm]}>{turn.assistantText}</Markdown>
+              : <span className="text-neutral-400">...</span>}
             {turn.streaming && turn.assistantText && (
               <span className="text-neutral-400 animate-pulse">▍</span>
             )}
