@@ -17,6 +17,7 @@
 import { useEffect, useState, useRef, useMemo } from "react";
 import { useAtom, useAtomValue, useSetAtom } from "jotai";
 import { invoke } from "@tauri-apps/api/core";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { onTauriEvent } from "./lib/onTauriEvent";
 import { JsonView, defaultStyles } from "react-json-view-lite";
 import "react-json-view-lite/dist/index.css";
@@ -45,6 +46,12 @@ function rid(): string {
   return Math.random().toString(36).slice(2, 10);
 }
 
+interface ReferenceInfo {
+  name: string;
+  path: string;
+  paragraphs: number;
+}
+
 export default function App() {
   const [input, setInput] = useState("");
   const [lastSent, setLastSent] = useState("");
@@ -52,6 +59,8 @@ export default function App() {
   const [driverGen, setDriverGen] = useState<number | null>(null);
   const [driverReady, setDriverReady] = useState(false);
   const [skills, setSkills] = useState<SkillEntry[]>([]);
+  const [references, setReferences] = useState<ReferenceInfo[]>([]);
+  const [refBusy, setRefBusy] = useState(false);
 
   const inputRef = useRef<HTMLInputElement>(null);
   const commands = useMemo(() => buildCommands(skills), [skills]);
@@ -218,6 +227,33 @@ export default function App() {
         sessionId: sid,
         kind: "system",
         text: txt,
+        severity: "info",
+      });
+      return;
+    }
+    if (msg.kind === "references:list" && Array.isArray(msg.references)) {
+      setReferences(msg.references as ReferenceInfo[]);
+      return;
+    }
+    if (msg.kind === "reference:attached" && msg.reference) {
+      const r = msg.reference as ReferenceInfo;
+      appendEvent({
+        id: rid(),
+        ts: Date.now(),
+        sessionId: sid,
+        kind: "system",
+        text: msg.reused ? `📎 已使用现有参考: ${r.name}` : `📎 已附加参考: ${r.name} (${r.paragraphs} 段)`,
+        severity: "info",
+      });
+      return;
+    }
+    if (msg.kind === "reference:detached") {
+      appendEvent({
+        id: rid(),
+        ts: Date.now(),
+        sessionId: sid,
+        kind: "system",
+        text: `📎 已移除参考: ${msg.name}`,
         severity: "info",
       });
       return;
@@ -480,6 +516,54 @@ export default function App() {
     }
   }, [turns]);
 
+  async function attachReference() {
+    if (refBusy) return;
+    setRefBusy(true);
+    try {
+      const picked = await openDialog({
+        multiple: false,
+        directory: false,
+        filters: [{ name: "Word", extensions: ["docx", "doc"] }],
+      });
+      if (!picked) return;
+      const path = typeof picked === "string" ? picked : Array.isArray(picked) ? picked[0] : null;
+      if (!path) return;
+      const id = `ref-${rid()}`;
+      await invoke("bun_send", {
+        line: JSON.stringify({ kind: "attach-reference", id, path }),
+      });
+    } catch (err) {
+      appendEvent({
+        id: rid(),
+        ts: Date.now(),
+        sessionId: currentSessionId ?? "global",
+        kind: "system",
+        text: `参考文档附加失败: ${err}`,
+        severity: "error",
+      });
+    } finally {
+      setRefBusy(false);
+    }
+  }
+
+  async function detachReference(name: string) {
+    const id = `ref-${rid()}`;
+    try {
+      await invoke("bun_send", {
+        line: JSON.stringify({ kind: "detach-reference", id, name }),
+      });
+    } catch (err) {
+      appendEvent({
+        id: rid(),
+        ts: Date.now(),
+        sessionId: currentSessionId ?? "global",
+        kind: "system",
+        text: `参考文档移除失败: ${err}`,
+        severity: "error",
+      });
+    }
+  }
+
   return (
     <main className="h-full flex flex-col bg-neutral-50 text-neutral-900">
       <header className="px-4 py-3 border-b border-neutral-200 bg-white flex items-baseline gap-3 shrink-0">
@@ -500,6 +584,36 @@ export default function App() {
           </select>
         )}
         {wordCtx && <WordCtxBar ctx={wordCtx} />}
+        <div className="flex items-center gap-1.5 flex-wrap">
+          {references.map((r) => (
+            <span
+              key={r.name}
+              className="text-xs bg-emerald-50 border border-emerald-200 rounded px-1.5 py-0.5 text-emerald-800 flex items-center gap-1"
+              title={r.path}
+            >
+              <span>📎</span>
+              <span className="font-medium truncate max-w-[140px]">{r.name}</span>
+              <span className="text-emerald-600">· {r.paragraphs} 段</span>
+              <button
+                type="button"
+                onClick={() => detachReference(r.name)}
+                className="text-emerald-600 hover:text-red-600 ml-0.5"
+                title="移除"
+              >
+                ✕
+              </button>
+            </span>
+          ))}
+          <button
+            type="button"
+            onClick={attachReference}
+            disabled={refBusy || !driverReady}
+            className="text-xs border border-dashed border-neutral-300 rounded px-1.5 py-0.5 text-neutral-600 hover:bg-neutral-50 hover:border-neutral-400 disabled:opacity-30"
+            title="附加参考文档（只读，仅作为参考；当前文档才是修改目标）"
+          >
+            + 参考文档
+          </button>
+        </div>
         <div className="ml-auto flex items-center gap-3 text-xs">
           <button
             type="button"

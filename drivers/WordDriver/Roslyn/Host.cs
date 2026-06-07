@@ -17,6 +17,14 @@ namespace MswordUse.WordDriver.Roslyn
     {
         public Word.Document Doc;
         public Word.Application App;
+        /// <summary>
+        /// Read-only reference documents the user attached via the UI. Keyed
+        /// by file basename (e.g. "国务院通知.docx"). Always opened
+        /// invisible + ReadOnly:=true. DO NOT call Save / SaveAs / set Text on
+        /// these — Track() does not protect them and revisions don't track
+        /// across docs anyway. Use them for reading format / sample content.
+        /// </summary>
+        public Dictionary<string, Word.Document> Refs;
         public StringBuilder __Stdout;
 
         public void Print(object o)
@@ -117,6 +125,7 @@ namespace MswordUse.WordDriver.Roslyn
             {
                 Doc = doc,
                 App = app,
+                Refs = new Dictionary<string, Word.Document>(WordSession.References(), StringComparer.OrdinalIgnoreCase),
                 __Stdout = new StringBuilder(),
             };
 

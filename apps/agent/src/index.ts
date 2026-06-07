@@ -88,7 +88,27 @@ const driverExe =
 const supervisor = new Supervisor({ exePath: driverExe, callTimeoutMs: 10_000 });
 supervisor.onGenChange = (info) => {
   write({ kind: "driver_restart", from: info.from, to: info.to, reason: info.reason });
+  // The driver lost its in-memory _refs dict; re-open everything we know about
+  // so Refs[name] in scripts continues to work after a hang+respawn.
+  void reattachAllReferences();
 };
+
+async function reattachAllReferences(): Promise<void> {
+  if (references.size === 0) return;
+  for (const r of Array.from(references.values())) {
+    try {
+      const resp = await supervisor.runScript(`_ref_open:${r.path}`);
+      if (resp.error) {
+        process.stderr.write(`[ref] reattach failed for ${r.name}: ${resp.error}\n`);
+        references.delete(r.name);
+      }
+    } catch (err: any) {
+      process.stderr.write(`[ref] reattach threw for ${r.name}: ${err?.message ?? err}\n`);
+      references.delete(r.name);
+    }
+  }
+  emitReferencesList();
+}
 
 // ---------- skills ----------
 
@@ -225,6 +245,15 @@ function handleLine(line: string) {
     case "list-skills":
       runListSkills(req);
       return;
+    case "attach-reference":
+      void runAttachReference(req);
+      return;
+    case "detach-reference":
+      void runDetachReference(req);
+      return;
+    case "list-references":
+      runListReferences(req);
+      return;
     case "shutdown":
       void runShutdown();
       return;
@@ -255,11 +284,12 @@ async function runChat(req: ChatReq) {
     : message;
 
   // /skill:<name>  trailing args  — explicit skill invocation.
-  // Match against currentSkills; if hit, prepend the formatted skill block
-  // to the message so the LLM sees the full SKILL.md without needing to
-  // call read() first. Falls through silently if the name is unknown — the
-  // LLM still gets the literal text and can ask the user to rephrase.
-  const userText = expandSkillCommand(targetWrapped);
+  const expanded = expandSkillCommand(targetWrapped);
+
+  // Prepend a runtime context block listing currently-attached references so
+  // the LLM knows about them every turn. Cheap (a few lines) and avoids relying
+  // on the model to remember prior context across turns.
+  const userText = prependReferenceContext(expanded);
 
   try {
     await agent.prompt(userText);
@@ -304,6 +334,99 @@ function composePromptWithTarget(message: string, target: PinnedTarget): string 
   lines.push("");
   lines.push(message);
   return lines.join("\n");
+}
+
+// ---------- reference documents ----------
+//
+// The driver keeps the actual COM handles (one global pool, since Word.Application
+// is a process-wide singleton). The sidecar keeps a parallel summary so the UI
+// has something to render and so chat prompts can prepend a context block
+// listing what's attached. This pair stays in sync as long as we go through
+// runAttachReference / runDetachReference (or driver_restart, which clears both).
+
+interface ReferenceInfo {
+  name: string;
+  path: string;
+  paragraphs: number;
+}
+
+const references = new Map<string, ReferenceInfo>();
+
+function emitReferencesList(reqId: string | null = null) {
+  write({
+    id: reqId,
+    kind: "references:list",
+    references: Array.from(references.values()),
+  });
+}
+
+function prependReferenceContext(message: string): string {
+  if (references.size === 0) return message;
+  const lines = ["[已附加参考文档]"];
+  for (const r of references.values()) {
+    lines.push(`  - ${r.name} (${r.paragraphs} 段)`);
+  }
+  lines.push(
+    "在 exec_csharp 中通过全局 Refs[\"<basename>\"] 只读访问 (Word.Document)。" +
+      "Refs 里的文档不要写入，Track() 只保护当前 Doc。",
+  );
+  lines.push("");
+  return `${lines.join("\n")}\n${message}`;
+}
+
+interface AttachRefReq {
+  id?: string;
+  path: string;
+}
+
+async function runAttachReference(req: AttachRefReq) {
+  const reqId = req.id ?? null;
+  if (typeof req.path !== "string" || req.path.trim().length === 0) {
+    write({ id: reqId, kind: "error", error: "attach-reference: path required" });
+    return;
+  }
+  try {
+    const resp = await supervisor.runScript(`_ref_open:${req.path}`);
+    if (resp.error) {
+      write({ id: reqId, kind: "error", error: resp.error });
+      return;
+    }
+    const r = resp.result as ReferenceInfo & { reused?: boolean };
+    references.set(r.name, { name: r.name, path: r.path, paragraphs: r.paragraphs });
+    write({ id: reqId, kind: "reference:attached", reference: references.get(r.name), reused: !!r.reused });
+    emitReferencesList(reqId);
+  } catch (err: any) {
+    write({ id: reqId, kind: "error", error: `attach-reference failed: ${err?.message ?? err}` });
+  }
+}
+
+interface DetachRefReq {
+  id?: string;
+  name: string;
+}
+
+async function runDetachReference(req: DetachRefReq) {
+  const reqId = req.id ?? null;
+  if (typeof req.name !== "string" || req.name.trim().length === 0) {
+    write({ id: reqId, kind: "error", error: "detach-reference: name required" });
+    return;
+  }
+  try {
+    const resp = await supervisor.runScript(`_ref_close:${req.name}`);
+    references.delete(req.name);
+    write({ id: reqId, kind: "reference:detached", name: req.name, ok: !resp.error });
+    emitReferencesList(reqId);
+  } catch (err: any) {
+    write({ id: reqId, kind: "error", error: `detach-reference failed: ${err?.message ?? err}` });
+  }
+}
+
+interface ListRefReq {
+  id?: string;
+}
+
+function runListReferences(req: ListRefReq) {
+  emitReferencesList(req.id ?? null);
 }
 
 interface RawReq {
