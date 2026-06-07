@@ -49,6 +49,8 @@ Track(() => {
 | Find/replace once | see "Find/Replace" below |
 | Change paragraph style | `p.Style = Doc.Styles["Heading 1"]` |
 
+**⚠️ 字符级格式守恒**：`rng.Text = "..."` 会把多 run 段落（含粗体 / 斜体 / 不同颜色 / 不同字号）压成单一格式 —— 内部格式信息全部丢失。任何要保格式的文字变更（翻译 / 改写 / polish 多 run 段落）必须先读 `word-runs-and-formatting` skill。
+
 ## Comments with author attribution
 
 ```csharp
