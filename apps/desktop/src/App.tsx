@@ -17,7 +17,7 @@
 import { useEffect, useState, useRef, useMemo } from "react";
 import { useAtom, useAtomValue, useSetAtom } from "jotai";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { onTauriEvent } from "./lib/onTauriEvent";
 import { JsonView, defaultStyles } from "react-json-view-lite";
 import "react-json-view-lite/dist/index.css";
 import Markdown from "react-markdown";
@@ -66,57 +66,46 @@ export default function App() {
   // ---- IPC ingestion ----
 
   useEffect(() => {
-    // StrictMode in dev mounts → unmounts → remounts effects to surface
-    // cleanup bugs. Tauri's `listen()` returns a Promise<unsubscribe> — the
-    // cleanup `offReply.then(u => u())` resolves async, so the listener from
-    // the first mount can still be alive when the second mount registers
-    // its own. That double-fires every bun:reply event → text_delta gets
-    // appended twice → '我来我来'. Guard with a closed flag so the stale
-    // listener becomes a no-op the moment cleanup runs.
-    let closed = false;
-    const offReply = listen<string>("bun:reply", (e) => {
-      if (closed) return;
+    // Subscribe via the module-level singleton so StrictMode double-mount,
+    // HMR remounts, and dependency-array changes can never produce >1 Tauri
+    // listener for the same channel. Cleanup is synchronous (Set.delete).
+    const offReply = onTauriEvent<string>("bun:reply", (payload) => {
       try {
-        const msg = JSON.parse(e.payload);
+        const msg = JSON.parse(payload);
         handleSidecarReply(msg);
       } catch {
         /* not JSON, ignore */
       }
     });
-    const offLog = listen<string>("bun:log", (e) => {
-      if (closed) return;
-      const line = e.payload;
-      if (/error|fail|panic|exit|timeout/i.test(line)) {
+    const offLog = onTauriEvent<string>("bun:log", (payload) => {
+      if (/error|fail|panic|exit|timeout/i.test(payload)) {
         const sid = currentSessionId ?? "global";
         appendEvent({
           id: rid(),
           ts: Date.now(),
           sessionId: sid,
           kind: "system",
-          text: line,
+          text: payload,
           severity: "error",
         });
       }
     });
     return () => {
-      closed = true;
-      void offReply.then((u) => u());
-      void offLog.then((u) => u());
+      offReply();
+      offLog();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentSessionId]);
 
   // Spotlight-initiated chats: receive sessionId + user message + trigger.
   useEffect(() => {
-    let closed = false;
-    const off = listen<{
+    const off = onTauriEvent<{
       id: string;
       message: string;
       sessionId?: string;
       trigger?: { title?: string; class?: string; isWord?: boolean; pid?: number };
-    }>("chat:start", (e) => {
-      if (closed) return;
-      const { id, message, sessionId: spotlightSid, trigger } = e.payload;
+    }>("chat:start", (payload) => {
+      const { id, message, sessionId: spotlightSid, trigger } = payload;
       const sid = spotlightSid ?? `s-${rid()}`;
       idToSession.current.set(id, sid);
       setCurrentSessionId(sid);
@@ -143,8 +132,7 @@ export default function App() {
       startPollChat(id, sid);
     });
     return () => {
-      closed = true;
-      void off.then((u) => u());
+      off();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

@@ -17,7 +17,7 @@
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { onTauriEvent } from "./lib/onTauriEvent";
 
 interface SpotlightInvoke {
   trigger_hwnd: number;
@@ -98,19 +98,15 @@ export default function SpotlightApp() {
       .catch((err) => dlog("initial pull failed", String(err)));
 
     // 2. Also listen for live invocations while we're already mounted.
-    // StrictMode mounts effects twice in dev; Tauri's listen() cleanup is
-    // async, so without a `closed` guard the first listener can survive
-    // into the second mount and double-fire every event.
-    let closed = false;
-    const offInvoke = listen<SpotlightInvoke>("spotlight:invoke", (e) => {
-      if (closed) return;
-      applyInvoke(e.payload);
+    // Use the module-level singleton so StrictMode / HMR can never produce
+    // >1 Tauri listener for the same channel.
+    const offInvoke = onTauriEvent<SpotlightInvoke>("spotlight:invoke", (payload) => {
+      applyInvoke(payload);
     });
 
-    const offReply = listen<string>("bun:reply", (e) => {
-      if (closed) return;
+    const offReply = onTauriEvent<string>("bun:reply", (payload) => {
       try {
-        const msg = JSON.parse(e.payload);
+        const msg = JSON.parse(payload);
         dlog("reply", msg);
 
         if (msg.kind === "agent_event" && msg.id && msg.id === pendingChatId.current) {
@@ -148,9 +144,8 @@ export default function SpotlightApp() {
     });
 
     return () => {
-      closed = true;
-      void offInvoke.then((u) => u());
-      void offReply.then((u) => u());
+      offInvoke();
+      offReply();
     };
   }, [reset]);
 
