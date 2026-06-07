@@ -51,11 +51,15 @@ cd msword-use-desktop
 bun install                # install workspace deps
 bun run driver:build       # build the .NET 4.8 Word COM driver
 
-# Export your Anthropic key — required for chat / polish
-# PowerShell:
-$env:ANTHROPIC_API_KEY = "sk-ant-..."
-# bash:
-export ANTHROPIC_API_KEY=sk-ant-...
+# Configure your API key — required for chat / polish.
+# Copy the example to your OS-standard config dir:
+#   Windows : %APPDATA%\msword-use\config.json
+#   macOS   : ~/Library/Application Support/msword-use/config.json
+#   Linux   : ~/.config/msword-use/config.json
+# (Override path: set MSWORD_CONFIG_PATH=/abs/path/to/config.json)
+#
+# Edit the copy and fill in apiKey, plus optional baseUrl / model /
+# disableThinkingField — see config.example.json for the full schema.
 
 bun run dev                # launch Tauri dev (Vite + Rust + Bun sidecar + auto-spawned WordDriver)
 ```
@@ -109,7 +113,7 @@ Tauri window tested in dev mode; `bun run build` (.msi packaging) is wired
 up but not yet exercised in CI.
 
 ### Known limitations (alpha)
-- `bun run dev` requires that `ANTHROPIC_API_KEY` is set in the launching shell
+- `bun run dev` requires `apiKey` set in the OS-standard `config.json` (see Quick start)
 - Inner sidecar binaries are not yet Authenticode-signed → SmartScreen warning on first run of a built .msi
 - Word must run unelevated (or both Word and the desktop app elevated together)
 - Comments on tracked insertions can fail silently in some Word versions — the edit still applies, just no `[AI:...]` comment

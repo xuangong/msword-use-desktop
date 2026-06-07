@@ -22,12 +22,13 @@ Thumbs.db
 .vscode/
 .idea/
 
-# Generated
-packages/rpc-schema/src/methods.ts
-
 # Secrets
 .env
 .env.local
+# msword-use runtime config (apiKey lives here — never commit)
+config.json
+apps/agent/config.json
+apps/desktop/config.json
 
 # Word lock files
 ~$*.docx

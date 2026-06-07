@@ -28,6 +28,7 @@ import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
 import { resolveAllowedRoots } from "./agent/skillsRoot";
 import { makeAgentFactory } from "./agent/agentFactory";
 import { SessionRegistry } from "./agent/sessionRegistry";
+import { loadConfig } from "./lib/config";
 import type { Agent, AgentEvent } from "@earendil-works/pi-agent-core";
 
 // ---------- Windows path-normalization wrapper for pi's NodeExecutionEnv ----------
@@ -100,7 +101,8 @@ for (const d of diagnostics) {
 
 // ---------- agent registry ----------
 
-const agentFactory = makeAgentFactory({ supervisor, skills });
+const config = loadConfig();
+const agentFactory = makeAgentFactory({ supervisor, skills, config });
 
 /** sid → request id of the in-flight prompt, if any. Used to tag events. */
 const currentPromptId = new Map<string, string>();

@@ -4,15 +4,21 @@
  * One factory instance is created at sidecar startup and bound to:
  *   - the singleton Supervisor (driver pipe)
  *   - the loaded skills (read at startup)
+ *   - the loaded MswordUseConfig (api key, base url, model, gateway tweaks)
  *
  * SessionRegistry then calls `factory(sessionId)` to lazily mint Agents.
  * Each Agent has its own message history; sid is just a label we keep on
  * the registry side.
+ *
+ * All LLM-runtime configuration comes from the MswordUseConfig. Environment
+ * variables are NOT consulted for api key / base url / model / thinking
+ * tweaks — write a config.json instead. See lib/config.ts for path resolution.
  */
 
 import { Agent, type Skill } from "@earendil-works/pi-agent-core";
 import { getModel } from "@earendil-works/pi-ai";
 import type { Supervisor } from "../rpc/supervisor";
+import type { MswordUseConfig } from "../lib/config";
 import { makeExecCsharpTool } from "./tools/execCsharp";
 import { readTool } from "./tools/read";
 import { buildSystemPrompt } from "./buildSystemPrompt";
@@ -20,44 +26,40 @@ import { buildSystemPrompt } from "./buildSystemPrompt";
 export interface AgentFactoryDeps {
   supervisor: Supervisor;
   skills: Skill[];
-  /** Override for tests — defaults to env-based lookup. */
+  config: MswordUseConfig;
+  /** Override for tests — defaults to config.apiKey. */
   getApiKey?: (provider: string) => Promise<string | undefined>;
-  /** Override for tests — defaults to anthropic claude-sonnet-4-5. */
-  modelId?: string;
 }
 
 const DEFAULT_PROVIDER = "anthropic";
 const DEFAULT_MODEL = "claude-sonnet-4-5";
 
-function envApiKey(provider: string): string | undefined {
-  if (provider === "anthropic") return process.env.ANTHROPIC_API_KEY;
-  return undefined;
-}
-
 export function makeAgentFactory(deps: AgentFactoryDeps): (sessionId: string) => Agent {
+  const { config } = deps;
   const systemPrompt = buildSystemPrompt(deps.skills);
-  const modelId = deps.modelId ?? DEFAULT_MODEL;
-  // pi-ai's getModel takes a string-literal union; we accept any string at the
-  // boundary (env override, tests) and let pi-ai return undefined for unknowns.
+  const modelId = config.model ?? DEFAULT_MODEL;
+  // pi-ai's getModel takes a string-literal union; we accept any string at
+  // the boundary (config override, tests) and let pi-ai return undefined for
+  // unknowns.
   const baseModel = getModel(DEFAULT_PROVIDER, modelId as any);
   if (!baseModel) {
     throw new Error(
       `agent factory: unknown model anthropic/${modelId}. ` +
-        `Set MSWORD_MODEL_ID or update DEFAULT_MODEL in agentFactory.ts.`,
+        `Set "model" in config.json or update DEFAULT_MODEL in agentFactory.ts.`,
     );
   }
 
-  // ANTHROPIC_BASE_URL override: pi-ai reads `model.baseUrl` (not env) when
-  // building the SDK client, so we override the field on the model object
-  // when a custom endpoint is configured (e.g. corporate proxy / OneAPI).
+  // baseUrl override: pi-ai reads `model.baseUrl` (not env) when building
+  // the SDK client, so we override the field on the model object when a
+  // custom endpoint is configured (corporate proxy / OneAPI / etc).
   //
-  // MSWORD_DISABLE_THINKING_FIELD=1: also strip `reasoning` from the model so
-  // pi-ai never sends the `thinking: {type, display}` schema. Required for
-  // upstream Anthropic-compatible gateways that don't yet implement the
+  // disableThinkingField: strips `reasoning` from the model so pi-ai never
+  // sends the `thinking: {type, display}` schema. Required for upstream
+  // Anthropic-compatible gateways that don't yet implement the
   // adaptive-thinking schema (they reject with 400 "thinking.disabled.display:
-  // Extra inputs are not permitted"). Drop this when the gateway supports it.
-  const baseUrlOverride = process.env.ANTHROPIC_BASE_URL?.trim();
-  const stripThinking = process.env.MSWORD_DISABLE_THINKING_FIELD === "1";
+  // Extra inputs are not permitted"). Drop this once the gateway supports it.
+  const baseUrlOverride = config.baseUrl?.trim();
+  const stripThinking = config.disableThinkingField === true;
   let model: typeof baseModel = baseModel;
   if (baseUrlOverride || stripThinking) {
     model = { ...baseModel } as typeof baseModel;
@@ -78,13 +80,11 @@ export function makeAgentFactory(deps: AgentFactoryDeps): (sessionId: string) =>
       },
       getApiKey: async (provider) => {
         if (deps.getApiKey) return deps.getApiKey(provider);
-        const key = envApiKey(provider);
-        if (!key) {
-          throw new Error(
-            `No API key for provider "${provider}". Set ANTHROPIC_API_KEY.`,
-          );
-        }
-        return key;
+        if (provider === "anthropic" && config.apiKey) return config.apiKey;
+        throw new Error(
+          `No API key for provider "${provider}". ` +
+            `Add "apiKey" to config.json (see config.example.json).`,
+        );
       },
     });
 }
