@@ -22,11 +22,12 @@
 
 import { resolve } from "node:path";
 import { Supervisor } from "./rpc/supervisor";
-import { loadSkills } from "@earendil-works/pi-agent-core";
+import { loadSkills, formatSkillInvocation } from "@earendil-works/pi-agent-core";
 // NodeExecutionEnv lives only on the /node subpath (not on the package root).
 import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
 import { resolveAllowedRoots } from "./agent/skillsRoot";
 import { makeAgentFactory } from "./agent/agentFactory";
+import { buildSystemPrompt } from "./agent/buildSystemPrompt";
 import { SessionRegistry } from "./agent/sessionRegistry";
 import { loadConfig } from "./lib/config";
 import { seedUserData } from "./lib/seedUserData";
@@ -98,17 +99,29 @@ seedUserData();
 
 const roots = resolveAllowedRoots();
 const env = new PosixNodeExecutionEnv({ cwd: resolve(roots.skills, "..") });
-const { skills, diagnostics } = await loadSkills(env, [roots.skills]);
-for (const d of diagnostics) {
-  // Warnings about malformed SKILL.md — surface to stderr so a dev sees them
-  // without polluting the protocol stream.
-  process.stderr.write(`[skills] ${d.code} at ${d.path}: ${d.message}\n`);
+
+/** Live skill registry. Mutated by handleReloadSkills(). */
+let currentSkills: Awaited<ReturnType<typeof loadSkills>>["skills"] = [];
+
+async function reloadSkillsFromDisk(): Promise<{ count: number; diagnostics: number }> {
+  const { skills, diagnostics } = await loadSkills(env, [roots.skills]);
+  currentSkills = skills;
+  for (const d of diagnostics) {
+    process.stderr.write(`[skills] ${d.code} at ${d.path}: ${d.message}\n`);
+  }
+  return { count: skills.length, diagnostics: diagnostics.length };
 }
+
+await reloadSkillsFromDisk();
 
 // ---------- agent registry ----------
 
 const config = loadConfig();
-const agentFactory = makeAgentFactory({ supervisor, skills, config });
+const agentFactory = makeAgentFactory({
+  supervisor,
+  getSkills: () => currentSkills,
+  config,
+});
 
 /** sid → request id of the in-flight prompt, if any. Used to tag events. */
 const currentPromptId = new Map<string, string>();
@@ -148,6 +161,19 @@ function write(obj: unknown) {
 }
 
 write({ ready: true, driverExe, gen: supervisor.generation });
+emitSkillsList();
+
+function emitSkillsList(reqId: string | null = null) {
+  write({
+    id: reqId,
+    kind: "skills:list",
+    skills: currentSkills.map((s) => ({
+      name: s.name,
+      description: s.description,
+      filePath: s.filePath,
+    })),
+  });
+}
 
 // ---------- chat FIFO ----------
 
@@ -193,6 +219,12 @@ function handleLine(line: string) {
     case "abort":
       runAbort(req);
       return;
+    case "reload-skills":
+      void runReloadSkills(req);
+      return;
+    case "list-skills":
+      runListSkills(req);
+      return;
     case "shutdown":
       void runShutdown();
       return;
@@ -218,9 +250,16 @@ async function runChat(req: ChatReq) {
   const agent = registry.getOrCreate(sessionId);
   currentPromptId.set(sessionId, id);
 
-  const userText = pinnedTarget?.paragraphIndex
+  const targetWrapped = pinnedTarget?.paragraphIndex
     ? composePromptWithTarget(message, pinnedTarget)
     : message;
+
+  // /skill:<name>  trailing args  — explicit skill invocation.
+  // Match against currentSkills; if hit, prepend the formatted skill block
+  // to the message so the LLM sees the full SKILL.md without needing to
+  // call read() first. Falls through silently if the name is unknown — the
+  // LLM still gets the literal text and can ask the user to rephrase.
+  const userText = expandSkillCommand(targetWrapped);
 
   try {
     await agent.prompt(userText);
@@ -234,6 +273,28 @@ async function runChat(req: ChatReq) {
   } finally {
     currentPromptId.delete(sessionId);
   }
+}
+
+const SKILL_PREFIX_RE = /^\/skill:([\w-]+)\s*(.*)$/;
+
+function expandSkillCommand(message: string): string {
+  // Skill prefix can appear after preamble; check first non-blank line.
+  const firstLine = message.split("\n").find((l) => l.trim().length > 0) ?? "";
+  const m = firstLine.trim().match(SKILL_PREFIX_RE);
+  if (!m) return message;
+
+  const [, name, rest] = m;
+  const skill = currentSkills.find((s) => s.name === name);
+  if (!skill) {
+    process.stderr.write(`[skill-cmd] unknown skill: ${name}\n`);
+    return message;
+  }
+  // Replace just that line with a formatted skill block, keep the rest.
+  // formatSkillInvocation produces the same XML envelope the LLM already
+  // sees in the systemPrompt skill index.
+  const skillBlock = formatSkillInvocation(skill, rest.trim() || undefined);
+  const remaining = message.replace(firstLine, "").replace(/^\n+/, "");
+  return remaining ? `${skillBlock}\n\n${remaining}` : skillBlock;
 }
 
 function composePromptWithTarget(message: string, target: PinnedTarget): string {
@@ -280,6 +341,49 @@ function runAbort(req: AbortReq) {
   if (!registry.has(req.sessionId)) return;
   const agent = registry.getOrCreate(req.sessionId);
   agent.abort();
+}
+
+interface ReloadSkillsReq {
+  id?: string;
+}
+
+async function runReloadSkills(req: ReloadSkillsReq) {
+  const reqId = req.id ?? null;
+  try {
+    const before = currentSkills.length;
+    const summary = await reloadSkillsFromDisk();
+    // Push the new systemPrompt to every live Agent so existing sessions
+    // pick up the new skills index immediately (no restart needed).
+    const newPrompt = buildSystemPrompt(currentSkills);
+    let updated = 0;
+    registry.forEach((_sid, agent) => {
+      agent.state.systemPrompt = newPrompt;
+      updated++;
+    });
+    write({
+      id: reqId,
+      kind: "skills:reloaded",
+      before,
+      after: summary.count,
+      diagnostics: summary.diagnostics,
+      updatedAgents: updated,
+    });
+    emitSkillsList(reqId);
+  } catch (err: any) {
+    write({
+      id: reqId,
+      kind: "error",
+      error: `reload-skills failed: ${err?.message ?? err}`,
+    });
+  }
+}
+
+interface ListSkillsReq {
+  id?: string;
+}
+
+function runListSkills(req: ListSkillsReq) {
+  emitSkillsList(req.id ?? null);
 }
 
 async function runShutdown() {

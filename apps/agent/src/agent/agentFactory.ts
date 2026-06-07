@@ -25,7 +25,14 @@ import { buildSystemPrompt } from "./buildSystemPrompt";
 
 export interface AgentFactoryDeps {
   supervisor: Supervisor;
-  skills: Skill[];
+  /**
+   * Snapshot of currently-loaded skills at the moment a new Agent is built.
+   * A getter (not an array) so the factory always sees the latest set after
+   * reload — newly minted Agents include skills added since startup. Existing
+   * Agents keep the prompt they were created with until index.ts pushes an
+   * update via Agent.state.systemPrompt = ...
+   */
+  getSkills: () => Skill[];
   config: MswordUseConfig;
   /** Override for tests — defaults to config.apiKey. */
   getApiKey?: (provider: string) => Promise<string | undefined>;
@@ -36,7 +43,6 @@ const DEFAULT_MODEL = "claude-sonnet-4-5";
 
 export function makeAgentFactory(deps: AgentFactoryDeps): (sessionId: string) => Agent {
   const { config } = deps;
-  const systemPrompt = buildSystemPrompt(deps.skills);
   const modelId = config.model ?? DEFAULT_MODEL;
   // pi-ai's getModel takes a string-literal union; we accept any string at
   // the boundary (config override, tests) and let pi-ai return undefined for
@@ -73,7 +79,7 @@ export function makeAgentFactory(deps: AgentFactoryDeps): (sessionId: string) =>
   return (_sessionId: string) =>
     new Agent({
       initialState: {
-        systemPrompt,
+        systemPrompt: buildSystemPrompt(deps.getSkills()),
         model: model as any, // pi-ai's strong types fight bun-types narrowing here.
         thinkingLevel: "off",
         tools,

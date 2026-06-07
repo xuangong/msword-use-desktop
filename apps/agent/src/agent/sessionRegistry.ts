@@ -80,6 +80,13 @@ export class SessionRegistry<TAgent> {
     return Array.from(this.entries.keys());
   }
 
+  /** Iterate over (sid, agent) pairs without exposing internals. */
+  forEach(fn: (sessionId: string, agent: TAgent) => void): void {
+    for (const [sid, entry] of this.entries) {
+      fn(sid, entry.agent);
+    }
+  }
+
   /** Drop a specific session and invoke onDispose. No-op if absent. */
   dispose(sessionId: string): void {
     const entry = this.entries.get(sessionId);

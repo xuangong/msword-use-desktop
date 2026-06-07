@@ -15,9 +15,14 @@
  *   5. On success, auto-hide after ~600ms; on error or Esc, hide immediately.
  */
 
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { onTauriEvent } from "./lib/onTauriEvent";
+import {
+  buildCommands,
+  useCommandPalette,
+  type SkillEntry,
+} from "./components/CommandPalette";
 
 interface SpotlightInvoke {
   trigger_hwnd: number;
@@ -55,8 +60,19 @@ export default function SpotlightApp() {
   const [phase, setPhase] = useState<Phase>("idle");
   const [statusText, setStatusText] = useState<string>("");
   const [hint, setHint] = useState<string>("");
+  const [skills, setSkills] = useState<SkillEntry[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
   const pendingChatId = useRef<string | null>(null);
+
+  const commands = useMemo(() => buildCommands(skills), [skills]);
+  const palette = useCommandPalette({
+    query: input,
+    commands,
+    onPick: (cmd) => {
+      setInput(cmd.fill);
+      setTimeout(() => inputRef.current?.focus(), 0);
+    },
+  });
 
   const reset = useCallback(() => {
     setInput("");
@@ -108,6 +124,23 @@ export default function SpotlightApp() {
       try {
         const msg = JSON.parse(payload);
         dlog("reply", msg);
+
+        // Sidecar pushes its skills inventory at startup and after every
+        // reload — track it so the command palette stays in sync.
+        if (msg.kind === "skills:list" && Array.isArray(msg.skills)) {
+          setSkills(msg.skills as SkillEntry[]);
+          return;
+        }
+
+        if (msg.kind === "skills:reloaded") {
+          setStatusText(
+            `↻ skills reloaded: ${msg.before} → ${msg.after}` +
+              (msg.diagnostics > 0 ? ` (${msg.diagnostics} warning)` : ""),
+          );
+          setPhase("success");
+          setTimeout(() => setPhase("idle"), 1500);
+          return;
+        }
 
         if (msg.kind === "agent_event" && msg.id && msg.id === pendingChatId.current) {
           const ev: AgentEvent = msg.event;
@@ -215,6 +248,26 @@ export default function SpotlightApp() {
     const message = input.trim();
     if (!message) return;
     if (phase === "thinking" || phase === "tool") return;
+
+    // Built-in commands shortcut into the sidecar protocol directly without
+    // going through the chat path. They DON'T create a new session.
+    if (message === "/reload-skills") {
+      const id = `cmd:${Math.random().toString(36).slice(2, 10)}`;
+      setPhase("thinking");
+      setStatusText("重新扫描 skills...");
+      try {
+        await invoke("bun_send", {
+          line: JSON.stringify({ kind: "reload-skills", id }),
+        });
+        // The sidecar emits `skills:list` + `skills:reloaded`; the bun:reply
+        // listener flips phase + statusText for us.
+        setInput("");
+      } catch (err) {
+        setPhase("error");
+        setStatusText(String(err));
+      }
+      return;
+    }
 
     const id = `chat:${Math.random().toString(36).slice(2, 10)}`;
     // Generate sessionId BEFORE the bun_send so the sidecar tags this chat
@@ -345,6 +398,7 @@ export default function SpotlightApp() {
             ⚠️ 当前不在 Word 窗口（{ctx.trigger_class || "未知"}）
           </div>
         )}
+        {palette.render()}
         <form
           onSubmit={(e) => {
             e.preventDefault();
@@ -357,7 +411,13 @@ export default function SpotlightApp() {
             ref={inputRef}
             value={input}
             onChange={(e) => setInput(e.currentTarget.value)}
-            placeholder="把选中文字改成公文 / 翻成英文..."
+            onKeyDown={(e) => {
+              // Let the palette swallow Up/Down/Tab/Enter when it's open
+              // and useful. handleKey returns false → fall through to the
+              // form's normal Enter-to-submit behavior.
+              palette.handleKey(e);
+            }}
+            placeholder="把选中文字改成公文 / 翻成英文…  (输入 / 看命令)"
             disabled={phase === "thinking" || phase === "tool"}
             className="flex-1 bg-transparent outline-none text-base placeholder-neutral-400 disabled:opacity-50"
           />
