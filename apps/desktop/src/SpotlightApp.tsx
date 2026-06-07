@@ -98,11 +98,17 @@ export default function SpotlightApp() {
       .catch((err) => dlog("initial pull failed", String(err)));
 
     // 2. Also listen for live invocations while we're already mounted.
+    // StrictMode mounts effects twice in dev; Tauri's listen() cleanup is
+    // async, so without a `closed` guard the first listener can survive
+    // into the second mount and double-fire every event.
+    let closed = false;
     const offInvoke = listen<SpotlightInvoke>("spotlight:invoke", (e) => {
+      if (closed) return;
       applyInvoke(e.payload);
     });
 
     const offReply = listen<string>("bun:reply", (e) => {
+      if (closed) return;
       try {
         const msg = JSON.parse(e.payload);
         dlog("reply", msg);
@@ -142,6 +148,7 @@ export default function SpotlightApp() {
     });
 
     return () => {
+      closed = true;
       void offInvoke.then((u) => u());
       void offReply.then((u) => u());
     };

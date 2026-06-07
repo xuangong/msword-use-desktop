@@ -66,7 +66,16 @@ export default function App() {
   // ---- IPC ingestion ----
 
   useEffect(() => {
+    // StrictMode in dev mounts → unmounts → remounts effects to surface
+    // cleanup bugs. Tauri's `listen()` returns a Promise<unsubscribe> — the
+    // cleanup `offReply.then(u => u())` resolves async, so the listener from
+    // the first mount can still be alive when the second mount registers
+    // its own. That double-fires every bun:reply event → text_delta gets
+    // appended twice → '我来我来'. Guard with a closed flag so the stale
+    // listener becomes a no-op the moment cleanup runs.
+    let closed = false;
     const offReply = listen<string>("bun:reply", (e) => {
+      if (closed) return;
       try {
         const msg = JSON.parse(e.payload);
         handleSidecarReply(msg);
@@ -75,6 +84,7 @@ export default function App() {
       }
     });
     const offLog = listen<string>("bun:log", (e) => {
+      if (closed) return;
       const line = e.payload;
       if (/error|fail|panic|exit|timeout/i.test(line)) {
         const sid = currentSessionId ?? "global";
@@ -89,6 +99,7 @@ export default function App() {
       }
     });
     return () => {
+      closed = true;
       void offReply.then((u) => u());
       void offLog.then((u) => u());
     };
@@ -97,12 +108,14 @@ export default function App() {
 
   // Spotlight-initiated chats: receive sessionId + user message + trigger.
   useEffect(() => {
+    let closed = false;
     const off = listen<{
       id: string;
       message: string;
       sessionId?: string;
       trigger?: { title?: string; class?: string; isWord?: boolean; pid?: number };
     }>("chat:start", (e) => {
+      if (closed) return;
       const { id, message, sessionId: spotlightSid, trigger } = e.payload;
       const sid = spotlightSid ?? `s-${rid()}`;
       idToSession.current.set(id, sid);
@@ -130,6 +143,7 @@ export default function App() {
       startPollChat(id, sid);
     });
     return () => {
+      closed = true;
       void off.then((u) => u());
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
