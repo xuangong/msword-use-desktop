@@ -50,10 +50,20 @@ export function makeAgentFactory(deps: AgentFactoryDeps): (sessionId: string) =>
   // ANTHROPIC_BASE_URL override: pi-ai reads `model.baseUrl` (not env) when
   // building the SDK client, so we override the field on the model object
   // when a custom endpoint is configured (e.g. corporate proxy / OneAPI).
+  //
+  // MSWORD_DISABLE_THINKING_FIELD=1: also strip `reasoning` from the model so
+  // pi-ai never sends the `thinking: {type, display}` schema. Required for
+  // upstream Anthropic-compatible gateways that don't yet implement the
+  // adaptive-thinking schema (they reject with 400 "thinking.disabled.display:
+  // Extra inputs are not permitted"). Drop this when the gateway supports it.
   const baseUrlOverride = process.env.ANTHROPIC_BASE_URL?.trim();
-  const model = baseUrlOverride
-    ? { ...baseModel, baseUrl: baseUrlOverride }
-    : baseModel;
+  const stripThinking = process.env.MSWORD_DISABLE_THINKING_FIELD === "1";
+  let model: typeof baseModel = baseModel;
+  if (baseUrlOverride || stripThinking) {
+    model = { ...baseModel } as typeof baseModel;
+    if (baseUrlOverride) (model as any).baseUrl = baseUrlOverride;
+    if (stripThinking) (model as any).reasoning = undefined;
+  }
 
   const execCsharp = makeExecCsharpTool(deps.supervisor);
   const tools = [execCsharp, readTool];
