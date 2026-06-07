@@ -8,7 +8,7 @@ const envelope = (event: any, sessionId = "sid_X", id: string | null = "req_1"):
   event,
 });
 
-test("message_start (user) → user_message with extracted text", () => {
+test("message_start (user) → null (UI echoes locally; pi re-emits on every turn)", () => {
   const ev = piEventToDebugEvent(
     envelope({
       type: "message_start",
@@ -19,12 +19,7 @@ test("message_start (user) → user_message with extracted text", () => {
     }),
     { reqId: "req_1" },
   );
-  expect(ev?.kind).toBe("user_message");
-  if (ev?.kind === "user_message") {
-    expect(ev.text).toBe("把这段改成公文");
-    expect(ev.sessionId).toBe("sid_X");
-    expect(ev.messageId).toBe("req_1");
-  }
+  expect(ev).toBeNull();
 });
 
 test("message_start (assistant) → null", () => {

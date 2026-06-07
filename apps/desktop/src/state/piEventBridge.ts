@@ -78,20 +78,15 @@ export function piEventToDebugEvent(
 
   switch (event.type) {
     case "message_start": {
-      // Only synthesise user_message events for the user message — assistant's
-      // message_start is tracked implicitly by text_delta / agent_end.
-      const role = (event as any).message?.role;
-      if (role !== "user") return null;
-      const content = (event as any).message?.content;
-      const text = extractUserText(content);
-      return {
-        kind: "user_message",
-        id: synthId("user"),
-        ts,
-        sessionId,
-        messageId,
-        text,
-      };
+      // Skip ALL message_start events. Rationale:
+      //   - For the user message: the UI already echoed it locally when the
+      //     prompt was submitted (spotlight chat:start → App.tsx, or main
+      //     window send). pi re-emits message_start every turn during a
+      //     multi-turn REPL, which would duplicate the user bubble N times.
+      //   - For the assistant message: text_delta / agent_end already drive
+      //     the UI; an empty assistant marker would be redundant.
+      // Single source of truth for user text = the original local echo.
+      return null;
     }
 
     case "message_update": {
@@ -183,15 +178,3 @@ export function piEventToDebugEvent(
   // any other code.
 }
 
-function extractUserText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
-      .map((c: any) => {
-        if (c && typeof c === "object" && c.type === "text") return c.text ?? "";
-        return "";
-      })
-      .join("");
-  }
-  return "";
-}
