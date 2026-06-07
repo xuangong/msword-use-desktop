@@ -33,6 +33,11 @@ import {
   sessionIdsAtom,
   setWordCtxAtom,
 } from "./state/atoms";
+import {
+  buildCommands,
+  useCommandPalette,
+  type SkillEntry,
+} from "./components/CommandPalette";
 import { piEventToDebugEvent } from "./state/piEventBridge";
 import type { ChatTurn, DebugEvent, DebugEventKind, ToolCall, WordContextSnapshot } from "./state/types";
 
@@ -46,6 +51,18 @@ export default function App() {
   const [pending, setPending] = useState(false);
   const [driverGen, setDriverGen] = useState<number | null>(null);
   const [driverReady, setDriverReady] = useState(false);
+  const [skills, setSkills] = useState<SkillEntry[]>([]);
+
+  const inputRef = useRef<HTMLInputElement>(null);
+  const commands = useMemo(() => buildCommands(skills), [skills]);
+  const palette = useCommandPalette({
+    query: input,
+    commands,
+    onPick: (cmd) => {
+      setInput(cmd.fill);
+      setTimeout(() => inputRef.current?.focus(), 0);
+    },
+  });
 
   const turns = useAtomValue(currentTurnsAtom);
   const events = useAtomValue(currentEventsAtom);
@@ -185,6 +202,27 @@ export default function App() {
     }
     if (msg.gen != null) setDriverGen(msg.gen);
 
+    // Sidecar broadcasts its skills inventory at startup and after every
+    // /reload-skills — track it so the command palette stays in sync.
+    if (msg.kind === "skills:list" && Array.isArray(msg.skills)) {
+      setSkills(msg.skills as SkillEntry[]);
+      return;
+    }
+    if (msg.kind === "skills:reloaded") {
+      const txt =
+        `↻ skills reloaded: ${msg.before} → ${msg.after}` +
+        (msg.diagnostics > 0 ? ` (${msg.diagnostics} warning)` : "");
+      appendEvent({
+        id: rid(),
+        ts: Date.now(),
+        sessionId: sid,
+        kind: "system",
+        text: txt,
+        severity: "info",
+      });
+      return;
+    }
+
     // pi-shaped agent event envelope: {sessionId, id, kind:"agent_event", event:<piEvent>}
     if (msg.kind === "agent_event" && msg.event) {
       const reqId: string | null = typeof msg.id === "string" ? msg.id : null;
@@ -315,6 +353,59 @@ export default function App() {
     const sid = currentSessionId ?? `s-${rid()}`;
     if (!currentSessionId) setCurrentSessionId(sid);
     idToSession.current.set(id, sid);
+
+    // Built-in command: /reload-skills — fan out to sidecar protocol directly,
+    // do NOT route through driver RPC (the sidecar will broadcast skills:list +
+    // skills:reloaded, which the bun:reply listener picks up).
+    if (line === "/reload-skills") {
+      try {
+        await invoke("bun_send", {
+          line: JSON.stringify({ kind: "reload-skills", id }),
+        });
+      } catch (err) {
+        appendEvent({
+          id: rid(),
+          ts: Date.now(),
+          sessionId: sid,
+          kind: "system",
+          text: `invoke failed: ${err}`,
+          severity: "error",
+        });
+      }
+      return;
+    }
+
+    // /skill:<name> [args] — treat as a chat message; the sidecar's
+    // expandSkillCommand prepends the formatted SKILL.md so the LLM sees it
+    // without an extra read() call.
+    const isSkillCmd = /^\/skill:[\w-]+/.test(line);
+    if (isSkillCmd) {
+      appendEvent({
+        id: rid(),
+        ts: Date.now(),
+        sessionId: sid,
+        messageId: id,
+        kind: "user_message",
+        text: line,
+      });
+      setPending(true);
+      const payload = { kind: "chat", id, sessionId: sid, message: line };
+      try {
+        await invoke("bun_send", { line: JSON.stringify(payload) });
+        startPollChat(id, sid);
+      } catch (err) {
+        appendEvent({
+          id: rid(),
+          ts: Date.now(),
+          sessionId: sid,
+          kind: "system",
+          text: `invoke failed: ${err}`,
+          severity: "error",
+        });
+        setPending(false);
+      }
+      return;
+    }
 
     if (isRaw) {
       const parts = line.slice(1).split(/\s+/);
@@ -449,17 +540,25 @@ export default function App() {
           </section>
 
           <form
-            className="p-3 border-t border-neutral-200 bg-white flex gap-2 items-center shrink-0"
+            className="p-3 border-t border-neutral-200 bg-white flex flex-col gap-2 shrink-0"
             onSubmit={(e) => {
               e.preventDefault();
               send();
             }}
           >
+            {palette.render()}
+            <div className="flex gap-2 items-center">
             <input
+              ref={inputRef}
               autoFocus
               value={input}
               onChange={(e) => setInput(e.currentTarget.value)}
-              placeholder={pending ? "等待回复..." : "请说... (/ping 走原始 RPC)"}
+              onKeyDown={(e) => {
+                // Palette consumes ArrowUp/Down/Tab/Enter when open; otherwise
+                // falls through to form submit on Enter.
+                palette.handleKey(e);
+              }}
+              placeholder={pending ? "等待回复..." : "请说... (输入 / 看命令；/ping 走原始 RPC)"}
               disabled={pending}
               className="flex-1 border border-neutral-300 rounded px-3 py-2 text-sm disabled:opacity-50"
             />
@@ -479,6 +578,7 @@ export default function App() {
             >
               发送
             </button>
+            </div>
           </form>
         </div>
 
