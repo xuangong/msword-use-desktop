@@ -39,13 +39,21 @@ export function makeAgentFactory(deps: AgentFactoryDeps): (sessionId: string) =>
   const modelId = deps.modelId ?? DEFAULT_MODEL;
   // pi-ai's getModel takes a string-literal union; we accept any string at the
   // boundary (env override, tests) and let pi-ai return undefined for unknowns.
-  const model = getModel(DEFAULT_PROVIDER, modelId as any);
-  if (!model) {
+  const baseModel = getModel(DEFAULT_PROVIDER, modelId as any);
+  if (!baseModel) {
     throw new Error(
       `agent factory: unknown model anthropic/${modelId}. ` +
         `Set MSWORD_MODEL_ID or update DEFAULT_MODEL in agentFactory.ts.`,
     );
   }
+
+  // ANTHROPIC_BASE_URL override: pi-ai reads `model.baseUrl` (not env) when
+  // building the SDK client, so we override the field on the model object
+  // when a custom endpoint is configured (e.g. corporate proxy / OneAPI).
+  const baseUrlOverride = process.env.ANTHROPIC_BASE_URL?.trim();
+  const model = baseUrlOverride
+    ? { ...baseModel, baseUrl: baseUrlOverride }
+    : baseModel;
 
   const execCsharp = makeExecCsharpTool(deps.supervisor);
   const tools = [execCsharp, readTool];
