@@ -16,6 +16,22 @@ apps/desktop/src-tauri/target/release/bundle/nsis/msword-use_0.1.0_x64-setup.exe
 apps/desktop/src-tauri/target/release/bundle/msi/msword-use_0.1.0_x64_en-US.msi
 ```
 
+To produce a repo-free distribution folder:
+
+```powershell
+bun run package:windows:dist
+```
+
+This writes:
+
+```text
+dist/msword-use-windows/
+  install-windows.ps1
+  msword-use_0.1.0_x64-setup.exe
+  msword-use_0.1.0_x64_en-US.msi
+  README.txt
+```
+
 The packaging step prepares Tauri resources before running `tauri build`:
 
 - `resources/sidecars/msword-agent.exe` — compiled Bun sidecar, so users do not need Bun installed.
@@ -44,3 +60,64 @@ At runtime, the installed app reads/writes user data here:
 ```
 
 For a clean distribution test, install the generated setup on a machine without Bun and without this repo. The app should still start its sidecar, seed bundled skills/docs into `%APPDATA%\msword-use`, and use the bundled WordDriver.
+
+## One-step local install
+
+For testing or internal distribution, use the install wrapper. It writes the
+runtime config for the current Windows user, runs the generated NSIS installer,
+and then launches the app:
+
+```powershell
+bun run install:windows -- `
+  -Endpoint "https://your-anthropic-compatible-endpoint.example" `
+  -ApiKey "replace-me"
+```
+
+If the installer has not been built yet:
+
+```powershell
+bun run install:windows -- -Build -Endpoint "https://your-anthropic-compatible-endpoint.example" -ApiKey "replace-me"
+```
+
+For deployment scripts, prefer environment variables so the key is not baked
+into repo files:
+
+```powershell
+$env:MSWORD_USE_ENDPOINT = "https://your-anthropic-compatible-endpoint.example"
+$env:MSWORD_USE_API_KEY = "replace-me"
+bun run install:windows -- -Silent
+```
+
+The wrapper creates:
+
+```text
+%APPDATA%\msword-use\config.json
+```
+
+The installer itself still does not contain a real API key. It only bundles the
+app, compiled sidecar, WordDriver, and default skills/docs.
+
+For distribution without the repo, put these two files in the same folder or
+zip them together:
+
+```text
+install-windows.ps1
+msword-use_0.1.0_x64-setup.exe
+msword-use_0.1.0_x64_en-US.msi
+```
+
+Then run:
+
+```powershell
+.\install-windows.ps1 -Endpoint "https://your-anthropic-compatible-endpoint.example" -ApiKey "replace-me"
+```
+
+To force the traditional MSI installer path:
+
+```powershell
+.\install-windows.ps1 -UseMsi -Endpoint "https://your-anthropic-compatible-endpoint.example" -ApiKey "replace-me"
+```
+
+The `.msi` can also be double-clicked directly. In that mode Windows Installer
+only installs the app; create `%APPDATA%\msword-use\config.json` separately, or
+add a first-run settings screen/custom MSI action later.
