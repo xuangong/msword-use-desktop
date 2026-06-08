@@ -1,15 +1,14 @@
 /**
- * NDJSON-over-stdio client for the .NET WordDriver subprocess.
+ * Single-action stdio client for the .NET WordDriver subprocess.
  *
- * Each call writes one JSON line to the driver's stdin and waits for the
- * matching JSON line on stdout. Hang detection (timeout) is the caller's
- * responsibility — see Supervisor for the wrapping retry/restart logic.
+ * Each call writes one JSON line {id, code} to the driver's stdin and waits
+ * for the matching JSON line {id, result, stdout, error} on stdout. Hang
+ * detection / restart is the Supervisor's responsibility.
  *
- * One DriverClient owns one child process. If the child dies or the caller
- * gives up on a hang, build a fresh DriverClient.
+ * One DriverClient owns one child process. If the child dies, build a fresh
+ * DriverClient.
  */
 
-import type { MethodName, Params, Result, RpcResponse } from "@msword/rpc-schema";
 import { NdjsonSplitter } from "./ndjson";
 
 export interface DriverClientOptions {
@@ -19,16 +18,23 @@ export interface DriverClientOptions {
 }
 
 export class DriverError extends Error {
-  constructor(message: string, public readonly method?: string) {
+  constructor(message: string) {
     super(message);
     this.name = "DriverError";
   }
 }
 
+export interface DriverResponse {
+  id: string;
+  result: unknown;
+  stdout: string;
+  error: string | null;
+}
+
 export class DriverClient {
   readonly proc: Bun.Subprocess<"pipe", "pipe", "pipe">;
   private nextId = 1;
-  private pending = new Map<string, (line: string) => void>();
+  private pending = new Map<string, (resp: DriverResponse) => void>();
   private closed = false;
   private exitPromise: Promise<number>;
 
@@ -41,15 +47,19 @@ export class DriverClient {
     });
     this.exitPromise = this.proc.exited.then((code) => {
       this.closed = true;
-      // Reject all pending responses so callers don't hang forever.
-      for (const [id, resolve] of this.pending) {
-        resolve(JSON.stringify({ id, result: null, error: `driver exited (code=${code})` }));
+      // Reject all in-flight callers so they don't hang forever after the
+      // child dies (kill, crash, Word killed externally, etc).
+      for (const [id, cb] of this.pending) {
+        cb({
+          id,
+          result: null,
+          stdout: "",
+          error: `driver exited (code=${code})`,
+        });
       }
       this.pending.clear();
       return code;
     });
-
-    // Stream stdout, split on newlines, dispatch to pending callers.
     void this.pump();
   }
 
@@ -60,59 +70,50 @@ export class DriverClient {
       const { value, done } = await reader.read();
       if (done) return;
       for (const line of splitter.push(value)) {
-        let parsed: RpcResponse;
-        try { parsed = JSON.parse(line); }
-        catch { continue; }
+        let parsed: DriverResponse;
+        try {
+          parsed = JSON.parse(line) as DriverResponse;
+        } catch {
+          continue;
+        }
         const cb = parsed.id ? this.pending.get(parsed.id) : null;
         if (cb) {
-          this.pending.delete(parsed.id!);
-          cb(line);
+          this.pending.delete(parsed.id);
+          cb(parsed);
         }
       }
     }
   }
 
-  async call<M extends MethodName>(method: M, params?: Params<M>): Promise<Result<M>> {
-    if (this.closed) throw new DriverError("driver already exited", method);
-
+  /** Run a C# script in the live Word session. */
+  async runScript(code: string): Promise<DriverResponse> {
+    if (this.closed) {
+      throw new DriverError("driver already exited");
+    }
     const id = String(this.nextId++);
-    const req = JSON.stringify({ id, method, params: params ?? {} });
-
-    const responseLine = await new Promise<string>((resolve) => {
+    const req = JSON.stringify({ id, code });
+    return await new Promise<DriverResponse>((resolve) => {
       this.pending.set(id, resolve);
       this.proc.stdin.write(req + "\n");
+      void this.proc.stdin.flush?.();
     });
-
-    const resp = JSON.parse(responseLine) as RpcResponse<M>;
-    if (resp.error) throw new DriverError(resp.error, method);
-    return resp.result as Result<M>;
   }
 
-  /** Send a raw method (for ad-hoc methods not in the typed schema, e.g. _freeze). */
-  async callRaw(method: string, params?: unknown): Promise<unknown> {
-    if (this.closed) throw new DriverError("driver already exited", method);
-    const id = String(this.nextId++);
-    const req = JSON.stringify({ id, method, params: params ?? {} });
-    const responseLine = await new Promise<string>((resolve) => {
-      this.pending.set(id, resolve);
-      this.proc.stdin.write(req + "\n");
-    });
-    const resp = JSON.parse(responseLine);
-    if (resp.error) throw new DriverError(resp.error, method);
-    return resp.result;
+  isClosed(): boolean {
+    return this.closed;
   }
 
-  kill() {
+  kill(): void {
     if (!this.closed) {
-      try { this.proc.kill(); } catch { /* already gone */ }
+      try {
+        this.proc.kill();
+      } catch {
+        /* best-effort */
+      }
     }
   }
 
   exited(): Promise<number> {
     return this.exitPromise;
-  }
-
-  isClosed(): boolean {
-    return this.closed;
   }
 }

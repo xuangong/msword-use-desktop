@@ -7,13 +7,17 @@ using Newtonsoft.Json.Linq;
 namespace MswordUse.WordDriver
 {
     /// <summary>
-    /// JSON-RPC entry point: reads NDJSON requests from stdin, dispatches to
-    /// method handlers, writes JSON results to stdout. One line per message.
+    /// Driver main loop.
     ///
-    /// Wire format:
-    ///   request : {"id":"<str>","method":"<str>","params":{...}}
-    ///   response: {"id":"<str>","result":{...},"error":null}
-    ///   error   : {"id":"<str>","result":null,"error":"<msg>"}
+    /// Wire format: line-delimited JSON (LF terminator).
+    ///   request:  {"id":"<str>","code":"<C# script>"}
+    ///   response: {"id":"<str>","result":<json>,"stdout":"<str>","error":null}
+    ///   error:    {"id":"<str>","result":null,"stdout":"<str>","error":"<msg>"}
+    ///
+    /// Special inputs:
+    ///   {"id":"x","code":"_freeze"}  — hidden test trigger: blocks forever so the
+    ///                                   sidecar supervisor can verify timeout+respawn.
+    ///   {"id":"x","code":"_shutdown"} — cooperative shutdown; returns then exits.
     /// </summary>
     static class Program
     {
@@ -34,76 +38,117 @@ namespace MswordUse.WordDriver
                 try { req = JObject.Parse(line); }
                 catch (Exception ex)
                 {
-                    WriteResponse(null, null, "parse_error: " + ex.Message);
+                    WriteResponse(null, null, "", "parse_error: " + ex.Message);
                     continue;
                 }
 
                 var id = req["id"]?.ToString();
-                var method = req["method"]?.ToString();
-                var paramsObj = req["params"] as JObject ?? new JObject();
+                var code = req["code"]?.ToString() ?? "";
+
+                // Test/shutdown pseudo-codes (kept verbatim from v0.3 for the
+                // existing supervisor hang test).
+                if (code == "_freeze")
+                {
+                    while (true) System.Threading.Thread.Sleep(1000);
+                }
+                if (code == "_shutdown")
+                {
+                    try { WordSession.CloseAllReferences(); } catch { }
+                    WriteResponse(id, new { bye = true }, "", null);
+                    return 0;
+                }
+
+                // Reference document management — bypass Roslyn for typed RPC.
+                // Format: _ref_open:<path> / _ref_close:<basename> / _ref_list / _ref_close_all
+                if (code.StartsWith("_ref_open:"))
+                {
+                    var path = code.Substring("_ref_open:".Length);
+                    try
+                    {
+                        var info = WordSession.OpenReference(path);
+                        WriteResponse(id, info, "", null);
+                    }
+                    catch (Exception ex)
+                    {
+                        WriteResponse(id, null, "", "ref_open_error: " + ex.Message);
+                    }
+                    continue;
+                }
+                if (code.StartsWith("_ref_close:"))
+                {
+                    var name = code.Substring("_ref_close:".Length);
+                    var ok = WordSession.CloseReference(name);
+                    WriteResponse(id, new { closed = ok, name = name }, "", null);
+                    continue;
+                }
+                if (code == "_ref_list")
+                {
+                    var list = new System.Collections.Generic.List<object>();
+                    foreach (var kv in WordSession.References())
+                    {
+                        try { list.Add(new { name = kv.Key, path = kv.Value.FullName, paragraphs = kv.Value.Paragraphs.Count }); }
+                        catch { /* dead handle, skip */ }
+                    }
+                    WriteResponse(id, new { references = list }, "", null);
+                    continue;
+                }
+                if (code == "_ref_close_all")
+                {
+                    WordSession.CloseAllReferences();
+                    WriteResponse(id, new { closed = true }, "", null);
+                    continue;
+                }
+                if (code.StartsWith("_perf."))
+                {
+                    try
+                    {
+                        var perfResult = DispatchPerf(code);
+                        WriteResponse(id, perfResult, "", null);
+                    }
+                    catch (Exception ex)
+                    {
+                        WriteResponse(id, null, "", "perf_error: " + ex.Message);
+                    }
+                    continue;
+                }
 
                 try
                 {
-                    object result;
-                    using (Perf.Scope(id, method))
+                    Roslyn.ExecResult er;
+                    using (Perf.Scope(id, "exec_csharp"))
                     {
                         var sw = System.Diagnostics.Stopwatch.StartNew();
-                        result = Dispatch(method, paramsObj);
+                        er = Roslyn.Host.Run(code);
                         sw.Stop();
-                        // Top-level RPC wall time. Tagged with the same scope so
-                        // it correlates to its child COM calls in the perf view.
-                        if (method != null && !method.StartsWith("_perf."))
-                        {
-                            Perf.Record("rpc:" + method, sw.ElapsedTicks * 1000_000L / System.Diagnostics.Stopwatch.Frequency, 0);
-                        }
+                        Perf.Record("exec_csharp", sw.ElapsedTicks * 1000_000L / System.Diagnostics.Stopwatch.Frequency, code.Length);
                     }
-                    WriteResponse(id, result, null);
+                    WriteResponse(id, er.Result, er.Stdout ?? "", er.Error);
                 }
                 catch (Exception ex)
                 {
-                    WriteResponse(id, null, ex.GetType().Name + ": " + ex.Message);
-                }
-
-                // P0-12: shutdown writes its response above via the normal
-                // path, then exits AFTER the write completes. The previous
-                // version wrote twice (once in Dispatch, once here).
-                if (method == "shutdown")
-                {
-                    return 0;
+                    WriteResponse(id, null, "", "host_error: " + ex.GetType().Name + ": " + ex.Message);
                 }
             }
             return 0;
         }
 
-        static object Dispatch(string method, JObject p)
+        static object DispatchPerf(string code)
         {
+            string method = code;
+            JObject p = new JObject();
+            var colon = code.IndexOf(':');
+            if (colon >= 0)
+            {
+                method = code.Substring(0, colon);
+                var payload = code.Substring(colon + 1);
+                if (!string.IsNullOrWhiteSpace(payload))
+                {
+                    p = JObject.Parse(payload);
+                }
+            }
+
             switch (method)
             {
-                case "ping":
-                    return new { pong = true };
-
-                // Hidden test method (not in schema): simulate a hang so the
-                // supervisor can verify timeout + kill+respawn end-to-end.
-                case "_freeze":
-                    while (true) System.Threading.Thread.Sleep(1000);
-
-                case "attach":
-                    return WordSession.Attach();
-
-                case "observe.selection":
-                    return Methods.Observe.Selection();
-                case "observe.outline":
-                    return Methods.Observe.Outline(p["maxLevel"]?.ToObject<int?>() ?? 3);
-                case "observe.paragraph":
-                    return Methods.Observe.Paragraph(p["index"].ToObject<int>());
-
-                case "polish.replaceRange":
-                    return Methods.Polish.ReplaceRange(p);
-                case "polish.addComment":
-                    return Methods.Polish.AddComment(p);
-
-                // ----- perf telemetry -----
-                // _-prefixed = raw channel, never appears in the public schema.
                 case "_perf.dump":
                 {
                     long since = p["since"]?.ToObject<long?>() ?? 0L;
@@ -119,7 +164,6 @@ namespace MswordUse.WordDriver
                     return new { ok = true };
                 case "_perf.record":
                 {
-                    // Sidecar pushes its own timings (e.g. LLM wall time).
                     string n = p["name"]?.ToString() ?? "(unknown)";
                     long us = p["durationUs"]?.ToObject<long?>() ?? 0L;
                     int ss = p["sampleSize"]?.ToObject<int?>() ?? 0;
@@ -128,24 +172,19 @@ namespace MswordUse.WordDriver
                     Perf.Record(n, us, ss, rid, mth);
                     return new { ok = true };
                 }
-
-                case "shutdown":
-                    // Return cleanly; the main loop writes our response then
-                    // exits the while-loop because of method == "shutdown".
-                    return new { bye = true };
-
                 default:
-                    throw new Exception("unknown method: " + method);
+                    throw new Exception("unknown perf method: " + method);
             }
         }
 
-        static void WriteResponse(string id, object result, string error)
+        static void WriteResponse(string id, object result, string stdout, string error)
         {
             var resp = new
             {
                 id = id,
                 result = error == null ? result : null,
-                error = error
+                stdout = stdout ?? "",
+                error = error,
             };
             Console.Out.WriteLine(JsonConvert.SerializeObject(resp));
             Console.Out.Flush();

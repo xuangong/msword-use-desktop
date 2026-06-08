@@ -2,20 +2,23 @@
  * Supervises a DriverClient: detects hangs via timeout, kills+restarts on hang,
  * tracks restart generations.
  *
- * Ported from `msword-use-spike/supervisor.py`. Same algorithm: race the RPC
- * call against an AbortController timeout; if timeout wins, kill and respawn.
+ * Same algorithm as v0.3 but the wrapped API is a single `runScript(code)`
+ * instead of `call(method, params)`.
  */
 
-import { DriverClient, DriverError, type DriverClientOptions } from "./driverClient";
-import type { MethodName, Params, Result } from "@msword/rpc-schema";
+import {
+  DriverClient,
+  DriverError,
+  type DriverClientOptions,
+  type DriverResponse,
+} from "./driverClient";
 
 /**
  * Minimal DriverClient surface the Supervisor uses. Real DriverClient
  * satisfies this; tests pass a mock to avoid spawning a real driver.
  */
 export interface DriverClientLike {
-  call<M extends MethodName>(method: M, params?: Params<M>): Promise<Result<M>>;
-  callRaw(method: string, params?: unknown): Promise<unknown>;
+  runScript(code: string): Promise<DriverResponse>;
   kill(): void;
   exited(): Promise<number>;
   isClosed?(): boolean;
@@ -34,14 +37,16 @@ export class Supervisor {
   private client: DriverClientLike;
   private gen = 1;
   private restartHistory: number[] = [];
-  private readonly opts: Required<Omit<SupervisorOptions, "factory">> & { factory: NonNullable<SupervisorOptions["factory"]> };
+  private readonly opts: Required<Omit<SupervisorOptions, "factory">> & {
+    factory: NonNullable<SupervisorOptions["factory"]>;
+  };
 
   constructor(opts: SupervisorOptions) {
     this.opts = {
       args: [],
-      callTimeoutMs: 5000,
+      callTimeoutMs: 10_000,
       maxRestartsPerMin: 3,
-      factory: (o) => new DriverClient(o),
+      factory: (o: DriverClientOptions) => new DriverClient(o),
       ...opts,
     } as any;
     this.client = this.opts.factory(this.opts);
@@ -51,50 +56,38 @@ export class Supervisor {
     return this.gen;
   }
 
-  async call<M extends MethodName>(method: M, params?: Params<M>): Promise<Result<M>> {
+  /** Run a C# script in the driver, with hang detection + restart on timeout. */
+  async runScript(code: string): Promise<DriverResponse> {
     await this.ensureAlive();
-    return await this.runWithTimeout(() => this.client.call(method, params), method);
-  }
-
-  async callRaw(method: string, params?: unknown): Promise<unknown> {
-    await this.ensureAlive();
-    return await this.runWithTimeout(() => this.client.callRaw(method, params), method);
+    return await this.runWithTimeout(() => this.client.runScript(code));
   }
 
   /**
-   * If the underlying driver child died (crashed, killed externally, etc),
-   * respawn before serving the next call. This is the "self-healing" path —
-   * runWithTimeout handles hangs; ensureAlive handles deaths.
-   *
-   * We DON'T route this through handleHang's per-minute throttle: a
-   * Word-killed-by-user death is not a runaway-loop signal and shouldn't
-   * count against the hang budget.
+   * Self-healing path: if the underlying child died (crashed, killed, etc),
+   * respawn before serving the next call. Distinct from hang handling, which
+   * goes through handleHang's per-minute throttle.
    */
   private async ensureAlive(): Promise<void> {
-    if ((this.client as any).isClosed?.()) {
-      await this.restart();
+    if (this.client.isClosed?.()) {
+      await this.restart("died");
     }
   }
 
-  private async runWithTimeout<T>(fn: () => Promise<T>, method: string): Promise<T> {
+  private async runWithTimeout(fn: () => Promise<DriverResponse>): Promise<DriverResponse> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new HangError(method)), this.opts.callTimeoutMs);
+      timer = setTimeout(() => reject(new HangError()), this.opts.callTimeoutMs);
     });
     const work = fn();
-    // P1: if the timeout wins, the in-flight work() promise will still
-    // resolve/reject later (when client.kill→exited→pending callback fires).
-    // Swallow that delayed rejection so it doesn't become an
-    // unhandledRejection — the supervisor already turned the hang into a
-    // HangError for the caller.
+    // Swallow delayed rejection from the abandoned work() promise so it
+    // doesn't surface as an unhandledRejection.
     work.catch(() => {});
     try {
       return await Promise.race([work, timeout]);
     } catch (err) {
       if (err instanceof HangError) {
-        // Kill the driver immediately so the in-flight `work` resolves with
-        // "driver exited" rather than continuing to take time before the
-        // user sees the failure. handleHang then respawns with throttling.
+        // Kill so the in-flight work() promise resolves promptly with a
+        // "driver exited" DriverResponse (which we then ignore).
         this.client.kill();
         await this.handleHang();
       }
@@ -112,7 +105,7 @@ export class Supervisor {
       );
     }
     this.restartHistory.push(Date.now());
-    await this.restart();
+    await this.restart("hang");
   }
 
   private trimRestartHistory() {
@@ -120,32 +113,31 @@ export class Supervisor {
     this.restartHistory = this.restartHistory.filter((t) => t > cutoff);
   }
 
-  async restart() {
+  async restart(reason = "manual") {
     const oldGen = this.gen;
-    // client.kill() is idempotent; runWithTimeout already called it for the
-    // hang path, but explicit restart() callers (tests, manual recovery) rely
-    // on us doing it here.
     this.client.kill();
     await this.client.exited();
     this.gen++;
     this.client = this.opts.factory(this.opts);
-    this.onGenChange?.({ from: oldGen, to: this.gen, reason: "hang" });
+    this.onGenChange?.({ from: oldGen, to: this.gen, reason });
   }
 
-  /** Caller can hook into generation changes to surface restart events to the UI. */
+  /** UI hook for showing restart toasts. */
   onGenChange?: (info: { from: number; to: number; reason: string }) => void;
 
   async shutdown() {
     try {
-      await this.runWithTimeout(() => this.client.callRaw("shutdown"), "shutdown");
-    } catch { /* expected — process exits right after */ }
+      await this.runWithTimeout(() => this.client.runScript("_shutdown"));
+    } catch {
+      /* expected — driver exits right after replying */
+    }
     this.client.kill();
   }
 }
 
 export class HangError extends Error {
-  constructor(public readonly method: string) {
-    super(`call timed out: ${method}`);
+  constructor() {
+    super(`driver call timed out`);
     this.name = "HangError";
   }
 }

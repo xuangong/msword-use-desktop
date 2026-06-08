@@ -34,6 +34,39 @@ static SIDECAR_GEN: Mutex<u32> = Mutex::new(0);
 static SIDECAR_REPLIES: Lazy<Mutex<HashMap<String, HashMap<String, Vec<String>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// C# snippet sent to the driver (via sidecar `kind:"raw"`) to capture the
+/// active paragraph + an 80-char preview when the spotlight hotkey fires.
+///
+/// Globals available (set up by drivers/WordDriver/Roslyn/Host.cs):
+///   - Doc (Word.Document)
+///   - App (Word.Application)
+///
+/// Returns:
+///   { paragraphIndex: int|null, preview: string }
+///
+/// Tolerant of "no selection" (returns null index + empty preview).
+const SNAPSHOT_SCRIPT: &str = r#"
+if (App == null || Doc == null) {
+    return new { paragraphIndex = (int?)null, preview = "" };
+}
+var sel = App.Selection;
+int? idx = null;
+if (sel != null && sel.Paragraphs.Count > 0) {
+    int targetStart = sel.Paragraphs[1].Range.Start;
+    int i = 1;
+    foreach (Microsoft.Office.Interop.Word.Paragraph p in Doc.Paragraphs) {
+        if (p.Range.Start == targetStart) { idx = i; break; }
+        i++;
+    }
+}
+string preview = "";
+if (idx.HasValue) {
+    var t = (Doc.Paragraphs[idx.Value].Range.Text ?? "").Trim('\r','\n','\x07',' ','\t');
+    preview = t.Length > 80 ? t.Substring(0, 80) : t;
+}
+return new { paragraphIndex = idx, preview = preview };
+"#;
+
 fn ensure_subscriber(name: &str) {
     if let Ok(mut top) = SIDECAR_REPLIES.lock() {
         top.entry(name.to_string()).or_insert_with(HashMap::new);
@@ -88,6 +121,11 @@ struct SpotlightInvoke {
     /// Monotonic counter so the UI can detect "this is a new invocation"
     /// even if all other fields are identical.
     seq: u64,
+    /// 1-based paragraph index for the current Word selection. None if Word
+    /// isn't focused or the snapshot fetch failed.
+    paragraph_index: Option<u32>,
+    /// Up to 80 chars of the active paragraph's text. Empty when no selection.
+    preview: String,
 }
 
 #[cfg(windows)]
@@ -120,6 +158,8 @@ fn capture_foreground() -> SpotlightInvoke {
             trigger_class: class,
             is_word,
             seq,
+            paragraph_index: None,
+            preview: String::new(),
         }
     }
 }
@@ -133,6 +173,8 @@ fn capture_foreground() -> SpotlightInvoke {
         trigger_class: String::new(),
         is_word: false,
         seq: 0,
+        paragraph_index: None,
+        preview: String::new(),
     }
 }
 
@@ -210,11 +252,20 @@ fn spotlight_take_reply(subscriber: Option<String>, id: String) -> Vec<String> {
 }
 
 fn show_spotlight(app: &AppHandle) {
-    let invoke = capture_foreground();
+    let mut invoke = capture_foreground();
     eprintln!(
         "[main] spotlight invoke: seq={} class={:?} title={:?} is_word={} hwnd={:#x} pid={}",
         invoke.seq, invoke.trigger_class, invoke.trigger_title, invoke.is_word, invoke.trigger_hwnd, invoke.trigger_pid,
     );
+
+    // Snapshot fetch: only worth attempting if the foreground is actually Word.
+    // Otherwise we'd spend 2s waiting for a script that's guaranteed to error.
+    if invoke.is_word {
+        let snap = fetch_snapshot_blocking(invoke.seq);
+        invoke.paragraph_index = snap.paragraph_index;
+        invoke.preview = snap.preview;
+    }
+
     if let Ok(mut g) = LAST_INVOKE.lock() {
         *g = Some(invoke.clone());
     }
@@ -222,13 +273,109 @@ fn show_spotlight(app: &AppHandle) {
         let _ = w.show();
         let _ = w.set_always_on_top(true);
         let _ = w.set_focus();
-        // Tauri 2: emit_to a specific webview is more reliable than the
-        // host-side w.emit which can land on the host event channel.
         if let Err(e) = app.emit_to(EventTarget::webview_window("spotlight"), "spotlight:invoke", invoke) {
             eprintln!("[main] spotlight:invoke emit_to failed: {}", e);
         }
     } else {
         eprintln!("[main] spotlight window not found");
+    }
+}
+
+#[derive(Clone, Serialize, Default)]
+struct SpotlightSnapshot {
+    paragraph_index: Option<u32>,
+    preview: String,
+}
+
+/// Send a `kind:"raw"` request to the sidecar with the SNAPSHOT_SCRIPT and
+/// wait up to 2s for the matching reply. On any failure (sidecar not up, no
+/// reply within budget, parse error, driver error), returns the default
+/// (no paragraph index, empty preview) — snapshot is best-effort.
+fn fetch_snapshot_blocking(seq: u64) -> SpotlightSnapshot {
+    let id = format!("snap_{}_{}", seq, std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0));
+
+    let payload = serde_json::json!({
+        "kind": "raw",
+        "id": id,
+        "code": SNAPSHOT_SCRIPT,
+    });
+    let line = match serde_json::to_string(&payload) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[snapshot] serialize failed: {}", e);
+            return SpotlightSnapshot::default();
+        }
+    };
+
+    // Write to sidecar stdin
+    let stdin_mutex = match SIDECAR_STDIN.get() {
+        Some(m) => m,
+        None => {
+            eprintln!("[snapshot] sidecar not initialized yet");
+            return SpotlightSnapshot::default();
+        }
+    };
+    if let Ok(mut stdin) = stdin_mutex.lock() {
+        if writeln!(stdin, "{}", line).is_err() {
+            eprintln!("[snapshot] write to sidecar failed");
+            return SpotlightSnapshot::default();
+        }
+        let _ = stdin.flush();
+    } else {
+        return SpotlightSnapshot::default();
+    }
+
+    // Poll the snapshot subscriber queue every 25ms, up to 2s.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
+    while std::time::Instant::now() < deadline {
+        let lines = SIDECAR_REPLIES
+            .lock()
+            .ok()
+            .and_then(|mut top| top.get_mut("snapshot").and_then(|q| q.remove(&id)))
+            .unwrap_or_default();
+        if !lines.is_empty() {
+            // Parse the FIRST line we got (sidecar emits a single raw_response per id).
+            let raw = &lines[0];
+            return parse_snapshot_line(raw);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    eprintln!("[snapshot] timed out after 2s");
+    SpotlightSnapshot::default()
+}
+
+fn parse_snapshot_line(raw: &str) -> SpotlightSnapshot {
+    let v: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[snapshot] parse failed: {}", e);
+            return SpotlightSnapshot::default();
+        }
+    };
+    // raw_response shape: {id, kind:"raw_response", result:..., stdout, error}
+    if v.get("error").and_then(|e| e.as_str()).is_some_and(|s| !s.is_empty()) {
+        eprintln!("[snapshot] driver error: {}", v["error"]);
+        return SpotlightSnapshot::default();
+    }
+    let result = match v.get("result") {
+        Some(r) => r,
+        None => return SpotlightSnapshot::default(),
+    };
+    let paragraph_index = result
+        .get("paragraphIndex")
+        .and_then(|p| p.as_u64())
+        .map(|n| n as u32);
+    let preview = result
+        .get("preview")
+        .and_then(|p| p.as_str())
+        .unwrap_or("")
+        .to_string();
+    SpotlightSnapshot {
+        paragraph_index,
+        preview,
     }
 }
 
@@ -380,6 +527,7 @@ pub fn run() {
     let toggle_shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyJ);
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(move |app, shortcut, event| {
@@ -412,6 +560,10 @@ pub fn run() {
                     }
                 });
             }
+
+            // Register a dedicated queue for spotlight snapshot replies so they
+            // don't race against the UI's main / spotlight subscriber queues.
+            ensure_subscriber("snapshot");
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {

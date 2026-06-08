@@ -17,9 +17,13 @@
 import { useEffect, useState, useRef, useMemo } from "react";
 import { useAtom, useAtomValue, useSetAtom } from "jotai";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { onTauriEvent } from "./lib/onTauriEvent";
 import { JsonView, defaultStyles } from "react-json-view-lite";
 import "react-json-view-lite/dist/index.css";
+import Markdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import "./App.css";
 import {
   appendEventAtom,
@@ -31,13 +35,19 @@ import {
   sessionIdsAtom,
   setWordCtxAtom,
 } from "./state/atoms";
+import {
+  buildCommands,
+  useCommandPalette,
+  type SkillEntry,
+} from "./components/CommandPalette";
+import { piEventToDebugEvent } from "./state/piEventBridge";
 import type { ChatTurn, DebugEvent, DebugEventKind, ToolCall, WordContextSnapshot } from "./state/types";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+
+function rid(): string {
+  return Math.random().toString(36).slice(2, 10);
+}
 
 async function openPerfWindow() {
-  // Reuse existing window if user already opened it.
   const existing = await WebviewWindow.getByLabel("perf");
   if (existing) {
     await existing.show();
@@ -51,26 +61,15 @@ async function openPerfWindow() {
     height: 720,
     resizable: true,
   });
-  // Surface load errors so the button isn't silent on failure.
   win.once("tauri://error", (e) => {
     console.error("[perf-window] failed:", e);
   });
 }
 
-function rid(): string {
-  return Math.random().toString(36).slice(2, 10);
-}
-
-interface AgentEventInner {
-  kind: "text_delta" | "tool_call" | "tool_result" | "done" | "error" | "llm_request" | "llm_response";
-  text?: string;
-  id?: string;
-  name?: string;
-  input?: unknown;
-  result?: unknown;
-  stopReason?: string | null;
-  error?: string;
-  payload?: any;
+interface ReferenceInfo {
+  name: string;
+  path: string;
+  paragraphs: number;
 }
 
 export default function App() {
@@ -79,7 +78,21 @@ export default function App() {
   const [pending, setPending] = useState(false);
   const [driverGen, setDriverGen] = useState<number | null>(null);
   const [driverReady, setDriverReady] = useState(false);
+  const [skills, setSkills] = useState<SkillEntry[]>([]);
+  const [references, setReferences] = useState<ReferenceInfo[]>([]);
+  const [refBusy, setRefBusy] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+
+  const inputRef = useRef<HTMLInputElement>(null);
+  const commands = useMemo(() => buildCommands(skills), [skills]);
+  const palette = useCommandPalette({
+    query: input,
+    commands,
+    onPick: (cmd) => {
+      setInput(cmd.fill);
+      setTimeout(() => inputRef.current?.focus(), 0);
+    },
+  });
 
   const turns = useAtomValue(currentTurnsAtom);
   const events = useAtomValue(currentEventsAtom);
@@ -100,50 +113,46 @@ export default function App() {
   // ---- IPC ingestion ----
 
   useEffect(() => {
-    const offReply = listen<string>("bun:reply", (e) => {
+    // Subscribe via the module-level singleton so StrictMode double-mount,
+    // HMR remounts, and dependency-array changes can never produce >1 Tauri
+    // listener for the same channel. Cleanup is synchronous (Set.delete).
+    const offReply = onTauriEvent<string>("bun:reply", (payload) => {
       try {
-        const msg = JSON.parse(e.payload);
-        // Agent events arrive on TWO paths in the main window: this listener AND
-        // the per-chat-id polling started in send()/chat:start. Skip them here
-        // so the chat UI doesn't duplicate every tool_call/text_delta — polling
-        // is the source of truth for chat-id-keyed events. Non-chat messages
-        // (ready, driver_restart, raw RPC replies) still flow through here.
-        if (msg.kind === "agent_event") return;
+        const msg = JSON.parse(payload);
         handleSidecarReply(msg);
       } catch {
         /* not JSON, ignore */
       }
     });
-    const offLog = listen<string>("bun:log", (e) => {
-      const line = e.payload;
-      if (/error|fail|panic|exit|timeout/i.test(line)) {
+    const offLog = onTauriEvent<string>("bun:log", (payload) => {
+      if (/error|fail|panic|exit|timeout/i.test(payload)) {
         const sid = currentSessionId ?? "global";
         appendEvent({
           id: rid(),
           ts: Date.now(),
           sessionId: sid,
           kind: "system",
-          text: line,
+          text: payload,
           severity: "error",
         });
       }
     });
     return () => {
-      void offReply.then((u) => u());
-      void offLog.then((u) => u());
+      offReply();
+      offLog();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentSessionId]);
 
   // Spotlight-initiated chats: receive sessionId + user message + trigger.
   useEffect(() => {
-    const off = listen<{
+    const off = onTauriEvent<{
       id: string;
       message: string;
       sessionId?: string;
       trigger?: { title?: string; class?: string; isWord?: boolean; pid?: number };
-    }>("chat:start", (e) => {
-      const { id, message, sessionId: spotlightSid, trigger } = e.payload;
+    }>("chat:start", (payload) => {
+      const { id, message, sessionId: spotlightSid, trigger } = payload;
       const sid = spotlightSid ?? `s-${rid()}`;
       idToSession.current.set(id, sid);
       setCurrentSessionId(sid);
@@ -170,7 +179,7 @@ export default function App() {
       startPollChat(id, sid);
     });
     return () => {
-      void off.then((u) => u());
+      off();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -189,7 +198,12 @@ export default function App() {
   }, []);
 
   function handleSidecarReply(msg: any) {
-    const sid = (msg.id && idToSession.current.get(msg.id)) ?? currentSessionId ?? "global";
+    // Prefer sessionId carried in the envelope (pi-shaped events). Fall back
+    // to the legacy idToSession map for v0.3-style replies that didn't carry
+    // sessionId. Phase 7 cleanup will assess removing the map.
+    const envSid: string | undefined = typeof msg.sessionId === "string" ? msg.sessionId : undefined;
+    const sid =
+      envSid ?? (msg.id && idToSession.current.get(msg.id)) ?? currentSessionId ?? "global";
 
     if (msg.ready) {
       setDriverReady(true);
@@ -211,19 +225,111 @@ export default function App() {
         ts: Date.now(),
         sessionId: sid,
         kind: "system",
-        text: `⚠️ 驱动重启 gen ${msg.from} → ${msg.to}（${msg.reason ?? "?"}）`,
+        text: `⚠️ 驱动重启 gen ${msg.from} → ${msg.to}(${msg.reason ?? "?"})`,
         severity: "warn",
       });
       return;
     }
     if (msg.gen != null) setDriverGen(msg.gen);
 
-    if (msg.kind === "agent_event" && msg.event) {
-      ingestAgentEvent(msg.id ?? "", msg.event, sid);
+    // Sidecar broadcasts its skills inventory at startup and after every
+    // /reload-skills — track it so the command palette stays in sync.
+    if (msg.kind === "skills:list" && Array.isArray(msg.skills)) {
+      setSkills(msg.skills as SkillEntry[]);
+      return;
+    }
+    if (msg.kind === "skills:reloaded") {
+      const txt =
+        `↻ skills reloaded: ${msg.before} → ${msg.after}` +
+        (msg.diagnostics > 0 ? ` (${msg.diagnostics} warning)` : "");
+      appendEvent({
+        id: rid(),
+        ts: Date.now(),
+        sessionId: sid,
+        kind: "system",
+        text: txt,
+        severity: "info",
+      });
+      return;
+    }
+    if (msg.kind === "references:list" && Array.isArray(msg.references)) {
+      setReferences(msg.references as ReferenceInfo[]);
+      return;
+    }
+    if (msg.kind === "reference:attached" && msg.reference) {
+      const r = msg.reference as ReferenceInfo;
+      appendEvent({
+        id: rid(),
+        ts: Date.now(),
+        sessionId: sid,
+        kind: "system",
+        text: msg.reused ? `📎 已使用现有参考: ${r.name}` : `📎 已附加参考: ${r.name} (${r.paragraphs} 段)`,
+        severity: "info",
+      });
+      return;
+    }
+    if (msg.kind === "reference:detached") {
+      appendEvent({
+        id: rid(),
+        ts: Date.now(),
+        sessionId: sid,
+        kind: "system",
+        text: `📎 已移除参考: ${msg.name}`,
+        severity: "info",
+      });
       return;
     }
 
-    // Driver RPC reply (raw)
+    // pi-shaped agent event envelope: {sessionId, id, kind:"agent_event", event:<piEvent>}
+    if (msg.kind === "agent_event" && msg.event) {
+      const reqId: string | null = typeof msg.id === "string" ? msg.id : null;
+      const debugEv = piEventToDebugEvent(
+        { sessionId: sid, id: reqId, kind: "agent_event", event: msg.event },
+        { reqId },
+      );
+      if (debugEv) {
+        appendEvent(debugEv);
+        // Mark turn as no-longer-pending when we see a terminal event.
+        if (debugEv.kind === "done" || debugEv.kind === "error") {
+          setPending(false);
+        }
+        // Side effects for tool_call inputs and tool_result previews —
+        // preserved from the v0.3 ingest path because the spotlight UI relies
+        // on the Word context strip being kept in sync.
+        if (debugEv.kind === "tool_call") {
+          const inp: any = debugEv.input;
+          if (inp && typeof inp === "object") {
+            const patch: Partial<WordContextSnapshot> = {};
+            if (typeof inp.paragraph_index === "number") {
+              patch.paragraphIndex = inp.paragraph_index;
+            }
+            if (Object.keys(patch).length > 0) {
+              setWordCtx({ sessionId: sid, patch });
+            }
+          }
+        } else if (debugEv.kind === "tool_result") {
+          const r: any = debugEv.result;
+          if (r && typeof r === "object" && r.preview_original) {
+            setWordCtx({
+              sessionId: sid,
+              patch: {
+                selectionText: r.preview_original,
+                paragraphIndex: r.paragraph_index ?? null,
+              },
+            });
+          }
+        }
+      }
+      return;
+    }
+
+    // Raw response (sidecar broadcasts driver RPC results). The spotlight
+    // window consumes its own raw replies; main window can ignore.
+    if (msg.kind === "raw_response") {
+      return;
+    }
+
+    // Driver RPC reply (raw) — kept for `/<method>` slash-command flow.
     if (msg.id && msg.result != null) {
       appendEvent({
         id: rid(),
@@ -246,94 +352,6 @@ export default function App() {
     }
   }
 
-  function ingestAgentEvent(chatId: string, ev: AgentEventInner, sid: string) {
-    const base = {
-      id: rid(),
-      ts: Date.now(),
-      sessionId: sid,
-      messageId: chatId,
-    };
-    if (ev.kind === "text_delta") {
-      appendEvent({ ...base, kind: "text_delta", text: ev.text ?? "" });
-    } else if (ev.kind === "tool_call") {
-      appendEvent({
-        ...base,
-        kind: "tool_call",
-        toolUseId: ev.id ?? rid(),
-        name: ev.name ?? "(unknown)",
-        input: ev.input,
-      });
-      // Side effect: if the tool call carries selection info, update the
-      // session's Word context. polish_text's input has paragraph_index
-      // when target='paragraph'; pinnedRange (set by spotlight) has start/end.
-      const inp: any = ev.input;
-      if (inp && typeof inp === "object") {
-        const patch: Partial<WordContextSnapshot> = {};
-        if (typeof inp.paragraph_index === "number") {
-          patch.paragraphIndex = inp.paragraph_index;
-        }
-        if (Object.keys(patch).length > 0) {
-          setWordCtx({ sessionId: sid, patch });
-        }
-      }
-    } else if (ev.kind === "tool_result") {
-      const ok = (ev.result as any)?.ok !== false;
-      appendEvent({
-        ...base,
-        kind: "tool_result",
-        toolUseId: ev.id ?? "",
-        name: ev.name ?? "",
-        result: ev.result,
-        ok,
-      });
-      // Surface "what got operated on" into the session's Word context so the
-      // header strip can show "段 5 · 一、培训目标" even mid-chat.
-      const r: any = ev.result;
-      if (r && typeof r === "object" && r.preview_original) {
-        setWordCtx({
-          sessionId: sid,
-          patch: {
-            selectionText: r.preview_original,
-            paragraphIndex: r.paragraph_index ?? null,
-          },
-        });
-      }
-    } else if (ev.kind === "done") {
-      appendEvent({
-        ...base,
-        kind: "done",
-        stopReason: ev.stopReason ?? null,
-        finalText: typeof (ev as any).text === "string" ? (ev as any).text : "",
-      });
-      setPending(false);
-    } else if (ev.kind === "error") {
-      appendEvent({ ...base, kind: "error", error: ev.error ?? "(unknown)" });
-      setPending(false);
-    } else if (ev.kind === "llm_request") {
-      const p = ev.payload ?? {};
-      appendEvent({
-        ...base,
-        kind: "llm_request",
-        model: p.model ?? "",
-        system: p.system ?? "",
-        messages: p.messages,
-        tools: p.tools,
-        cacheSystem: !!p.cacheSystem,
-        maxTokens: p.maxTokens ?? 0,
-      });
-    } else if (ev.kind === "llm_response") {
-      const p = ev.payload ?? {};
-      appendEvent({
-        ...base,
-        kind: "llm_response",
-        stopReason: p.stopReason ?? null,
-        text: p.text ?? "",
-        toolUses: p.toolUses,
-        usage: p.usage,
-      });
-    }
-  }
-
   // ---- chat poll (Tauri 2 emit_to → listen unreliable in this webview) ----
 
   function startPollChat(chatId: string, sid: string) {
@@ -350,11 +368,21 @@ export default function App() {
       for (const raw of replies) {
         try {
           const msg = JSON.parse(raw);
-          // Make sure session lookup works.
+          // Maintain id→session lookup so the bun:reply listener (which is the
+          // SOLE event-dispatch path) can resolve sessionId. Do NOT call
+          // handleSidecarReply here — the listener already did that. Calling it
+          // a second time would double-append every text_delta. The polling
+          // path exists ONLY to drain this subscriber queue (otherwise it grows
+          // unbounded) and to detect the agent_end / error stop signal so we
+          // can flip `pending` off and clean up.
           if (msg.id) idToSession.current.set(msg.id, sid);
-          handleSidecarReply(msg);
-          if (msg.kind === "agent_event" && (msg.event?.kind === "done" || msg.event?.kind === "error")) {
-            done = true;
+          // Pi-shaped events use `event.type`; v0.3 used `event.kind`. Accept both
+          // for resilience while the bridge phase settles.
+          if (msg.kind === "agent_event") {
+            const t = msg.event?.type ?? msg.event?.kind;
+            if (t === "agent_end" || t === "error" || t === "done") {
+              done = true;
+            }
           }
         } catch { /* ignore */ }
       }
@@ -362,6 +390,7 @@ export default function App() {
         setTimeout(tick, 100);
       } else {
         polledIds.current.delete(chatId);
+        setPending(false);
       }
     };
     setTimeout(tick, 50);
@@ -382,6 +411,59 @@ export default function App() {
     if (!currentSessionId) setCurrentSessionId(sid);
     idToSession.current.set(id, sid);
 
+    // Built-in command: /reload-skills — fan out to sidecar protocol directly,
+    // do NOT route through driver RPC (the sidecar will broadcast skills:list +
+    // skills:reloaded, which the bun:reply listener picks up).
+    if (line === "/reload-skills") {
+      try {
+        await invoke("bun_send", {
+          line: JSON.stringify({ kind: "reload-skills", id }),
+        });
+      } catch (err) {
+        appendEvent({
+          id: rid(),
+          ts: Date.now(),
+          sessionId: sid,
+          kind: "system",
+          text: `invoke failed: ${err}`,
+          severity: "error",
+        });
+      }
+      return;
+    }
+
+    // /skill:<name> [args] — treat as a chat message; the sidecar's
+    // expandSkillCommand prepends the formatted SKILL.md so the LLM sees it
+    // without an extra read() call.
+    const isSkillCmd = /^\/skill:[\w-]+/.test(line);
+    if (isSkillCmd) {
+      appendEvent({
+        id: rid(),
+        ts: Date.now(),
+        sessionId: sid,
+        messageId: id,
+        kind: "user_message",
+        text: line,
+      });
+      setPending(true);
+      const payload = { kind: "chat", id, sessionId: sid, message: line };
+      try {
+        await invoke("bun_send", { line: JSON.stringify(payload) });
+        startPollChat(id, sid);
+      } catch (err) {
+        appendEvent({
+          id: rid(),
+          ts: Date.now(),
+          sessionId: sid,
+          kind: "system",
+          text: `invoke failed: ${err}`,
+          severity: "error",
+        });
+        setPending(false);
+      }
+      return;
+    }
+
     if (isRaw) {
       const parts = line.slice(1).split(/\s+/);
       const method = parts[0];
@@ -393,7 +475,11 @@ export default function App() {
           params = {};
         }
       }
-      const payload = { id, method, params };
+      const code =
+        params == null || (typeof params === "object" && Object.keys(params).length === 0)
+          ? method
+          : `${method}:${JSON.stringify(params)}`;
+      const payload = { kind: "raw", id, code };
       appendEvent({
         id: rid(),
         ts: Date.now(),
@@ -427,7 +513,7 @@ export default function App() {
         text: line,
       });
       setPending(true);
-      const payload = { kind: "chat", id, message: line };
+      const payload = { kind: "chat", id, sessionId: sid, message: line };
       try {
         await invoke("bun_send", { line: JSON.stringify(payload) });
         startPollChat(id, sid);
@@ -455,16 +541,59 @@ export default function App() {
     }
   }, [turns]);
 
+  async function attachReference() {
+    if (refBusy) return;
+    setRefBusy(true);
+    try {
+      const picked = await openDialog({
+        multiple: false,
+        directory: false,
+        filters: [{ name: "Word", extensions: ["docx", "doc"] }],
+      });
+      if (!picked) return;
+      const path = typeof picked === "string" ? picked : Array.isArray(picked) ? picked[0] : null;
+      if (!path) return;
+      const id = `ref-${rid()}`;
+      await invoke("bun_send", {
+        line: JSON.stringify({ kind: "attach-reference", id, path }),
+      });
+    } catch (err) {
+      appendEvent({
+        id: rid(),
+        ts: Date.now(),
+        sessionId: currentSessionId ?? "global",
+        kind: "system",
+        text: `参考文档附加失败: ${err}`,
+        severity: "error",
+      });
+    } finally {
+      setRefBusy(false);
+    }
+  }
+
+  async function detachReference(name: string) {
+    const id = `ref-${rid()}`;
+    try {
+      await invoke("bun_send", {
+        line: JSON.stringify({ kind: "detach-reference", id, name }),
+      });
+    } catch (err) {
+      appendEvent({
+        id: rid(),
+        ts: Date.now(),
+        sessionId: currentSessionId ?? "global",
+        kind: "system",
+        text: `参考文档移除失败: ${err}`,
+        severity: "error",
+      });
+    }
+  }
+
   return (
     <main className="h-full flex flex-col bg-neutral-50 text-neutral-900">
-      <header className="px-4 py-3 border-b border-neutral-200 bg-white flex items-center gap-3 shrink-0 whitespace-nowrap">
-        <h1 className="text-lg font-semibold shrink-0">msword-use</h1>
-        <p
-          className="text-xs text-neutral-500 shrink min-w-0 truncate"
-          title="v2-alpha · 自然语言操作 Word · 修订模式"
-        >
-          v2-alpha · 自然语言操作 Word · 修订模式
-        </p>
+      <header className="px-4 py-3 border-b border-neutral-200 bg-white flex items-baseline gap-3 shrink-0">
+        <h1 className="text-lg font-semibold">msword-use</h1>
+        <p className="text-xs text-neutral-500">v2-alpha · 自然语言操作 Word · 修订模式</p>
         <div className="relative shrink-0">
           <button
             type="button"
@@ -499,7 +628,7 @@ export default function App() {
           <select
             value={currentSessionId ?? ""}
             onChange={(e) => setCurrentSessionId(e.currentTarget.value || null)}
-            className="text-xs border border-neutral-300 rounded px-1.5 py-0.5 bg-white shrink-0"
+            className="text-xs border border-neutral-300 rounded px-1.5 py-0.5 bg-white"
             title="切换会话"
           >
             {sessionIds.map((id, i) => (
@@ -509,8 +638,38 @@ export default function App() {
             ))}
           </select>
         )}
-        {wordCtx && <div className="min-w-0 shrink truncate"><WordCtxBar ctx={wordCtx} /></div>}
-        <div className="ml-auto flex items-center gap-3 text-xs shrink-0">
+        {wordCtx && <WordCtxBar ctx={wordCtx} />}
+        <div className="flex items-center gap-1.5 flex-wrap">
+          {references.map((r) => (
+            <span
+              key={r.name}
+              className="text-xs bg-emerald-50 border border-emerald-200 rounded px-1.5 py-0.5 text-emerald-800 flex items-center gap-1"
+              title={r.path}
+            >
+              <span>📎</span>
+              <span className="font-medium truncate max-w-[140px]">{r.name}</span>
+              <span className="text-emerald-600">· {r.paragraphs} 段</span>
+              <button
+                type="button"
+                onClick={() => detachReference(r.name)}
+                className="text-emerald-600 hover:text-red-600 ml-0.5"
+                title="移除"
+              >
+                ✕
+              </button>
+            </span>
+          ))}
+          <button
+            type="button"
+            onClick={attachReference}
+            disabled={refBusy || !driverReady}
+            className="text-xs border border-dashed border-neutral-300 rounded px-1.5 py-0.5 text-neutral-600 hover:bg-neutral-50 hover:border-neutral-400 disabled:opacity-30"
+            title="附加参考文档（只读，仅作为参考；当前文档才是修改目标）"
+          >
+            + 参考文档
+          </button>
+        </div>
+        <div className="ml-auto flex items-center gap-3 text-xs">
           <button
             type="button"
             onClick={clearAll}
@@ -529,7 +688,7 @@ export default function App() {
             />
             驱动 {driverReady ? `gen=${driverGen ?? "?"}` : <BootTimer startedAt={mountedAt.current} />}
           </span>
-          <span className="text-neutral-400 hidden lg:inline" title="指令前加 / 走原始 RPC">
+          <span className="text-neutral-400">
             指令前加 <code className="bg-neutral-100 px-1 rounded">/</code> 走原始 RPC
           </span>
         </div>
@@ -550,17 +709,25 @@ export default function App() {
           </section>
 
           <form
-            className="p-3 border-t border-neutral-200 bg-white flex gap-2 items-center shrink-0"
+            className="p-3 border-t border-neutral-200 bg-white flex flex-col gap-2 shrink-0"
             onSubmit={(e) => {
               e.preventDefault();
               send();
             }}
           >
+            {palette.render()}
+            <div className="flex gap-2 items-center">
             <input
+              ref={inputRef}
               autoFocus
               value={input}
               onChange={(e) => setInput(e.currentTarget.value)}
-              placeholder={pending ? "等待回复..." : "请说... (/ping 走原始 RPC)"}
+              onKeyDown={(e) => {
+                // Palette consumes ArrowUp/Down/Tab/Enter when open; otherwise
+                // falls through to form submit on Enter.
+                palette.handleKey(e);
+              }}
+              placeholder={pending ? "等待回复..." : "请说... (输入 / 看命令；/ping 走原始 RPC)"}
               disabled={pending}
               className="flex-1 border border-neutral-300 rounded px-3 py-2 text-sm disabled:opacity-50"
             />
@@ -580,6 +747,7 @@ export default function App() {
             >
               发送
             </button>
+            </div>
           </form>
         </div>
 
@@ -611,16 +779,10 @@ function TurnView({ turn }: { turn: ChatTurn }) {
 
       {(turn.assistantText || turn.streaming) && (
         <div className="flex justify-start">
-          <div className="max-w-[85%] bg-white border border-neutral-200 rounded-2xl rounded-tl-sm px-4 py-2 text-sm break-words">
-            {turn.assistantText ? (
-              <div className="markdown-body">
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                  {turn.assistantText}
-                </ReactMarkdown>
-              </div>
-            ) : (
-              <span className="text-neutral-400">...</span>
-            )}
+          <div className="max-w-[85%] bg-white border border-neutral-200 rounded-2xl rounded-tl-sm px-4 py-2 text-sm break-words assistant-md">
+            {turn.assistantText
+              ? <Markdown remarkPlugins={[remarkGfm]}>{turn.assistantText}</Markdown>
+              : <span className="text-neutral-400">...</span>}
             {turn.streaming && turn.assistantText && (
               <span className="text-neutral-400 animate-pulse">▍</span>
             )}
@@ -689,54 +851,12 @@ function ToolCallView({ tc }: { tc: ToolCall }) {
 
 function DebugPanel({ events }: { events: DebugEvent[] }) {
   const [filter, setFilter] = useState<"all" | DebugEventKind>("all");
-  // Kinds the user has muted via the chip toolbar. Default: hide the noisy
-  // driver_send/driver_recv pair so polish_text doesn't drown out tool_call /
-  // text_delta / done. Toggle from the chip strip below.
-  const [hidden, setHidden] = useState<Set<DebugEventKind>>(
-    () => new Set<DebugEventKind>(["driver_send", "driver_recv"]),
-  );
   const visible = useMemo(
-    () =>
-      events.filter((e) => {
-        if (filter !== "all" && e.kind !== filter) return false;
-        if (filter === "all" && hidden.has(e.kind)) return false;
-        return true;
-      }),
-    [events, filter, hidden],
+    () => (filter === "all" ? events : events.filter((e) => e.kind === filter)),
+    [events, filter],
   );
   // We render newest-first.
   const reversed = useMemo(() => [...visible].reverse(), [visible]);
-
-  const toggleHidden = (k: DebugEventKind) => {
-    setHidden((prev) => {
-      const next = new Set(prev);
-      if (next.has(k)) next.delete(k);
-      else next.add(k);
-      return next;
-    });
-  };
-
-  // Per-kind counts so the chip can show "driver_recv (47)" — useful to know
-  // what you're hiding before you toggle it.
-  const counts = useMemo(() => {
-    const m = new Map<DebugEventKind, number>();
-    for (const e of events) m.set(e.kind, (m.get(e.kind) ?? 0) + 1);
-    return m;
-  }, [events]);
-
-  const allKinds: DebugEventKind[] = [
-    "user_message",
-    "llm_request",
-    "llm_response",
-    "text_delta",
-    "tool_call",
-    "tool_result",
-    "done",
-    "error",
-    "driver_send",
-    "driver_recv",
-    "system",
-  ];
 
   return (
     <>
@@ -764,30 +884,6 @@ function DebugPanel({ events }: { events: DebugEvent[] }) {
           <option value="system">system</option>
         </select>
       </div>
-      {filter === "all" && (
-        <div className="px-3 py-2 border-b border-neutral-100 flex flex-wrap gap-1 shrink-0">
-          {allKinds.map((k) => {
-            const isHidden = hidden.has(k);
-            const c = counts.get(k) ?? 0;
-            return (
-              <button
-                key={k}
-                onClick={() => toggleHidden(k)}
-                title={isHidden ? `点击显示 ${k}` : `点击隐藏 ${k}`}
-                className={
-                  "text-[10px] font-mono px-1.5 py-0.5 rounded border " +
-                  (isHidden
-                    ? "bg-neutral-50 text-neutral-400 border-neutral-200 line-through"
-                    : "bg-white text-neutral-700 border-neutral-300 hover:bg-neutral-50")
-                }
-              >
-                {k}
-                {c > 0 && <span className="ml-1 text-neutral-400">{c}</span>}
-              </button>
-            );
-          })}
-        </div>
-      )}
       <div className="flex-1 overflow-auto">
         {reversed.length === 0 ? (
           <div className="p-4 text-xs text-neutral-400">
@@ -911,16 +1007,7 @@ function WordCtxBar({ ctx }: { ctx: WordContextSnapshot }) {
       : ctx.selectionText
     : null;
   return (
-    <span
-      className="text-xs text-neutral-500 flex items-center gap-1.5 px-2 py-0.5 bg-neutral-100 rounded"
-      title={[
-        docName,
-        ctx.paragraphIndex != null ? `段 ${ctx.paragraphIndex}` : null,
-        ctx.selectionText ? `"${ctx.selectionText}"` : null,
-      ]
-        .filter(Boolean)
-        .join(" · ")}
-    >
+    <span className="text-xs text-neutral-500 flex items-center gap-1.5 px-2 py-0.5 bg-neutral-100 rounded">
       <span>📄</span>
       <span className="text-neutral-800 font-medium truncate max-w-[160px]">
         {docName ?? "(未链接)"}

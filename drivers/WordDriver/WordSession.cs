@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.IO;
 using System.Runtime.InteropServices;
 using Word = Microsoft.Office.Interop.Word;
 
@@ -111,6 +113,110 @@ namespace MswordUse.WordDriver
                 documents = _app.Documents.Count,
                 activeDoc = _app.Documents.Count > 0 ? _app.ActiveDocument.Name : null
             };
+        }
+
+        // ---------- reference documents (read-only attachments) ----------
+        //
+        // The UI lets the user pick one or more .docx files as "reference"
+        // material. We open each invisibly via Documents.Open(ReadOnly:=true,
+        // Visible:=false) so the user's foreground Word session is undisturbed,
+        // and expose them to LLM-authored scripts via Globals.Refs[name].
+        //
+        // Storage is a simple Dictionary keyed by the file's basename (which
+        // is what scripts will reference). If the same basename is opened
+        // twice, the existing handle is reused; if a different file with the
+        // same basename comes in, the old one is closed first.
+        //
+        // Lifecycle: scripts treat these as read-only — there is no Save()
+        // path. CloseReference() is called on detach + on driver shutdown
+        // (best-effort; if Word died, the COM call no-ops).
+
+        static readonly Dictionary<string, Word.Document> _refs = new Dictionary<string, Word.Document>(StringComparer.OrdinalIgnoreCase);
+
+        public static IDictionary<string, Word.Document> References()
+        {
+            return _refs;
+        }
+
+        public static object OpenReference(string fullPath)
+        {
+            if (string.IsNullOrWhiteSpace(fullPath)) throw new Exception("path is empty");
+            if (!File.Exists(fullPath)) throw new Exception("file not found: " + fullPath);
+            var name = Path.GetFileName(fullPath);
+            var app = App();
+            // If we already opened this name, decide: same path → reuse; different
+            // path → close the old one and open the new one.
+            if (_refs.TryGetValue(name, out var existing))
+            {
+                try
+                {
+                    if (string.Equals(existing.FullName, fullPath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return new { name, path = existing.FullName, paragraphs = existing.Paragraphs.Count, reused = true };
+                    }
+                    CloseDoc(existing);
+                }
+                catch { /* dead handle, just drop */ }
+                _refs.Remove(name);
+            }
+            object pathObj = fullPath;
+            object readOnly = true;
+            object visible = false;
+            object addToRecent = false;
+            // Documents.Open is heavily overloaded; use named-args via reflection-style
+            // would be cleaner, but Word's late-bound surface accepts boxed `object`
+            // refs in this order: FileName, ConfirmConversions, ReadOnly, AddToRecentFiles
+            // … (a long tail). We pass ReadOnly + AddToRecentFiles + Visible explicitly.
+            object missing = Type.Missing;
+            var doc = app.Documents.Open(
+                ref pathObj,
+                ref missing,           // ConfirmConversions
+                ref readOnly,
+                ref addToRecent,
+                ref missing,           // PasswordDocument
+                ref missing,           // PasswordTemplate
+                ref missing,           // Revert
+                ref missing,           // WritePasswordDocument
+                ref missing,           // WritePasswordTemplate
+                ref missing,           // Format
+                ref missing,           // Encoding
+                ref visible,
+                ref missing,           // OpenAndRepair
+                ref missing,           // DocumentDirection
+                ref missing,           // NoEncodingDialog
+                ref missing            // XMLTransform
+            );
+            _refs[name] = doc;
+            return new { name, path = doc.FullName, paragraphs = doc.Paragraphs.Count, reused = false };
+        }
+
+        public static bool CloseReference(string name)
+        {
+            if (!_refs.TryGetValue(name, out var doc)) return false;
+            _refs.Remove(name);
+            CloseDoc(doc);
+            return true;
+        }
+
+        public static void CloseAllReferences()
+        {
+            foreach (var kv in new List<KeyValuePair<string, Word.Document>>(_refs))
+            {
+                CloseDoc(kv.Value);
+            }
+            _refs.Clear();
+        }
+
+        static void CloseDoc(Word.Document doc)
+        {
+            try
+            {
+                object save = Word.WdSaveOptions.wdDoNotSaveChanges;
+                object originalFormat = Type.Missing;
+                object routeDocument = Type.Missing;
+                doc.Close(ref save, ref originalFormat, ref routeDocument);
+            }
+            catch { /* dead handle, ignore */ }
         }
     }
 }

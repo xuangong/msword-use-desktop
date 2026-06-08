@@ -16,7 +16,11 @@ function rid(): string {
 
 export async function rawCall(method: string, params: unknown = {}): Promise<unknown> {
   const id = `raw-${rid()}`;
-  await invoke("bun_send", { line: JSON.stringify({ id, method, params }) });
+  const code =
+    params == null || (typeof params === "object" && Object.keys(params as Record<string, unknown>).length === 0)
+      ? method
+      : `${method}:${JSON.stringify(params)}`;
+  await invoke("bun_send", { line: JSON.stringify({ kind: "raw", id, code }) });
 
   // Poll the named "perf" subscriber. We register it lazily on first call.
   if (!registered) {

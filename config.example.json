@@ -1,0 +1,8 @@
+{
+  "_comment": "Copy this to %APPDATA%/msword-use/config.json on Windows, ~/.config/msword-use/config.json on Linux, or ~/Library/Application Support/msword-use/config.json on macOS. Override with MSWORD_CONFIG_PATH env var. All fields are optional; sidecar starts with empty config and the agent throws on first prompt if apiKey is missing.",
+
+  "apiKey": "sk-ant-api03-...",
+  "baseUrl": "https://api.anthropic.com",
+  "model": "claude-sonnet-4-5",
+  "disableThinkingField": false
+}

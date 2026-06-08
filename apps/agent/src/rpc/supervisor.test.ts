@@ -1,155 +1,121 @@
-/**
- * Supervisor unit tests. Uses a mock DriverClient — no real subprocess.
- *
- * Run: bun test (from apps/agent/)
- */
-
-import { test, expect, describe } from "bun:test";
+import { test, expect } from "bun:test";
 import { Supervisor, HangError, type DriverClientLike } from "./supervisor";
-import type { MethodName, Params, Result } from "@msword/rpc-schema";
+import type { DriverResponse } from "./driverClient";
 
-/** Configurable mock: scripted behavior per call. */
+/** A scriptable mock that replaces the real driver process. */
 class MockDriver implements DriverClientLike {
-  exitResolve!: (code: number) => void;
-  exitPromise: Promise<number>;
-  killed = false;
-  callBehaviors: Array<(method: string, drv: MockDriver) => Promise<any>> = [];
-  callCount = 0;
-  /** Pending resolvers for in-flight calls — flushed by kill(). */
-  pendingRejecters: Array<(e: Error) => void> = [];
+  public runScriptImpl: (code: string) => Promise<DriverResponse>;
+  public killed = false;
+  private exitResolve: (code: number) => void = () => {};
+  private exitPromise: Promise<number>;
 
-  constructor(behaviors: Array<(method: string, drv: MockDriver) => Promise<any>> = []) {
-    this.callBehaviors = behaviors;
-    this.exitPromise = new Promise((r) => (this.exitResolve = r));
+  constructor(behavior?: (code: string) => Promise<DriverResponse>) {
+    this.runScriptImpl = behavior ?? (async () => ({
+      id: "1",
+      result: { ok: true },
+      stdout: "",
+      error: null,
+    }));
+    this.exitPromise = new Promise((res) => (this.exitResolve = res));
   }
-
-  async call<M extends MethodName>(method: M, _params?: Params<M>): Promise<Result<M>> {
-    const idx = this.callCount++;
-    const behavior = this.callBehaviors[idx] ?? (async () => ({ pong: true } as any));
-    return behavior(method, this) as any;
+  async runScript(code: string) {
+    if (this.killed) throw new Error("dead");
+    return this.runScriptImpl(code);
   }
-
-  async callRaw(method: string): Promise<unknown> {
-    const idx = this.callCount++;
-    const behavior = this.callBehaviors[idx] ?? (async () => ({}));
-    return behavior(method, this);
-  }
-
-  kill(): void {
-    if (this.killed) return;
-    this.killed = true;
-    // Mimic real DriverClient: flush in-flight callers with a "driver exited"
-    // rejection, so a "hang" Promise that's tied to this driver finally settles
-    // and the supervisor's runWithTimeout doesn't keep the event loop alive.
-    for (const reject of this.pendingRejecters) {
-      reject(new Error("driver exited (code=0)"));
+  kill() {
+    if (!this.killed) {
+      this.killed = true;
+      this.exitResolve(143);
     }
-    this.pendingRejecters = [];
-    this.exitResolve(0);
   }
-
-  exited(): Promise<number> {
+  exited() {
     return this.exitPromise;
+  }
+  isClosed() {
+    return this.killed;
   }
 }
 
-/** Behavior helper: a call that hangs until the driver is killed. */
-const hangUntilKilled = () => (_method: string, drv: MockDriver) =>
-  new Promise((_, reject) => {
-    drv.pendingRejecters.push(reject);
+test("runScript: forwards code and returns result", async () => {
+  let received = "";
+  const mock = new MockDriver(async (code) => {
+    received = code;
+    return { id: "1", result: 42, stdout: "", error: null };
+  });
+  const sup = new Supervisor({
+    exePath: "/dev/null",
+    factory: () => mock,
+  });
+  const r = await sup.runScript("return 42;");
+  expect(received).toBe("return 42;");
+  expect(r.result).toBe(42);
+  expect(r.error).toBeNull();
+});
+
+test("runScript: throws HangError when call exceeds timeout, then respawns", async () => {
+  let factoryCalls = 0;
+  const mocks: MockDriver[] = [];
+  const sup = new Supervisor({
+    exePath: "/dev/null",
+    callTimeoutMs: 50,
+    factory: () => {
+      factoryCalls++;
+      const m = new MockDriver(
+        () => new Promise<DriverResponse>(() => {}), // hangs forever
+      );
+      mocks.push(m);
+      return m;
+    },
   });
 
-describe("Supervisor", () => {
-  test("normal call passes through and gen stays at 1", async () => {
-    const drv = new MockDriver([async () => ({ pong: true })]);
-    const sup = new Supervisor({
-      exePath: "noop",
-      factory: () => drv,
-      callTimeoutMs: 1000,
-    });
-    const r = await sup.call("ping");
-    expect(r).toEqual({ pong: true } as any);
-    expect(sup.generation).toBe(1);
-    expect(drv.killed).toBe(false);
+  expect(factoryCalls).toBe(1);
+  await expect(sup.runScript("while(true){}")).rejects.toBeInstanceOf(HangError);
+  // After the hang, supervisor should have killed mock 1 and built mock 2.
+  expect(mocks[0]!.killed).toBe(true);
+  expect(factoryCalls).toBe(2);
+  expect(sup.generation).toBe(2);
+});
+
+test("ensureAlive respawns after external death", async () => {
+  let factoryCalls = 0;
+  const sup = new Supervisor({
+    exePath: "/dev/null",
+    factory: () => {
+      factoryCalls++;
+      return new MockDriver();
+    },
+  });
+  // Simulate the child dying out from under us.
+  (sup as any).client.kill();
+  // Next runScript should detect closed and rebuild.
+  await sup.runScript("return 1;");
+  expect(factoryCalls).toBe(2);
+  expect(sup.generation).toBe(2);
+});
+
+test("hang restart budget: throws DriverError after maxRestartsPerMin", async () => {
+  const sup = new Supervisor({
+    exePath: "/dev/null",
+    callTimeoutMs: 20,
+    maxRestartsPerMin: 2,
+    factory: () => new MockDriver(() => new Promise<DriverResponse>(() => {})),
   });
 
-  test("hung call throws HangError and triggers a respawn (gen 1 → 2)", async () => {
-    // First driver: hangs until killed.
-    const drv1 = new MockDriver([hangUntilKilled()]);
-    // Replacement driver: healthy.
-    const drv2 = new MockDriver([async () => ({ pong: true })]);
-    let nth = 0;
-    const sup = new Supervisor({
-      exePath: "noop",
-      callTimeoutMs: 100,
-      factory: () => (nth++ === 0 ? drv1 : drv2),
-    });
+  await expect(sup.runScript("hang1")).rejects.toBeInstanceOf(HangError);
+  await expect(sup.runScript("hang2")).rejects.toBeInstanceOf(HangError);
+  // 3rd hang exceeds budget → DriverError, NOT HangError.
+  await expect(sup.runScript("hang3")).rejects.toThrow(/giving up/);
+});
 
-    await expect(sup.call("ping")).rejects.toThrow(HangError);
-    expect(drv1.killed).toBe(true);
-    expect(sup.generation).toBe(2);
-
-    const r = await sup.call("ping");
-    expect(r).toEqual({ pong: true } as any);
+test("onGenChange fires with reason 'hang'", async () => {
+  const events: Array<{ from: number; to: number; reason: string }> = [];
+  const sup = new Supervisor({
+    exePath: "/dev/null",
+    callTimeoutMs: 20,
+    factory: () => new MockDriver(() => new Promise<DriverResponse>(() => {})),
   });
+  sup.onGenChange = (info) => events.push(info);
 
-  test("onGenChange fires on every respawn with from/to/reason", async () => {
-    const drv1 = new MockDriver([hangUntilKilled()]);
-    const drv2 = new MockDriver([async () => ({ pong: true })]);
-    let nth = 0;
-    const sup = new Supervisor({
-      exePath: "noop",
-      callTimeoutMs: 50,
-      factory: () => (nth++ === 0 ? drv1 : drv2),
-    });
-    const seen: Array<{ from: number; to: number; reason: string }> = [];
-    sup.onGenChange = (info) => seen.push(info);
-
-    await expect(sup.call("ping")).rejects.toThrow(HangError);
-    expect(seen).toEqual([{ from: 1, to: 2, reason: "hang" }]);
-  });
-
-  test("restart throttle: more than maxRestartsPerMin hangs throws DriverError", async () => {
-    // Every driver instance hangs.
-    const sup = new Supervisor({
-      exePath: "noop",
-      callTimeoutMs: 30,
-      maxRestartsPerMin: 2,
-      factory: () => new MockDriver([hangUntilKilled()]),
-    });
-
-    // First hang → respawn (gen 1→2), still throws HangError to caller.
-    await expect(sup.call("ping")).rejects.toThrow(HangError);
-    // Second hang → respawn (gen 2→3), still throws HangError.
-    await expect(sup.call("ping")).rejects.toThrow(HangError);
-    // Third hang → would be gen 3→4, but we hit the per-minute cap of 2.
-    // handleHang throws DriverError instead of restarting.
-    await expect(sup.call("ping")).rejects.toThrow(/restarted 2 times/);
-  });
-
-  test("a delayed rejection from the hung call doesn't become unhandled", async () => {
-    // Driver where kill() triggers a delayed work() rejection.
-    const drv1 = new MockDriver([hangUntilKilled()]);
-    const drv2 = new MockDriver([async () => ({ pong: true })]);
-    let nth = 0;
-    const sup = new Supervisor({
-      exePath: "noop",
-      callTimeoutMs: 50,
-      factory: () => (nth++ === 0 ? drv1 : drv2),
-    });
-
-    // Snapshot unhandledRejection events during the call.
-    const unhandled: unknown[] = [];
-    const handler = (e: unknown) => unhandled.push(e);
-    process.on("unhandledRejection", handler);
-
-    try {
-      await expect(sup.call("ping")).rejects.toThrow(HangError);
-      // Wait long enough for any delayed driver-exit rejection to fire.
-      await new Promise((r) => setTimeout(r, 100));
-      expect(unhandled).toEqual([]);
-    } finally {
-      process.off("unhandledRejection", handler);
-    }
-  });
+  await expect(sup.runScript("hang")).rejects.toBeInstanceOf(HangError);
+  expect(events).toEqual([{ from: 1, to: 2, reason: "hang" }]);
 });
