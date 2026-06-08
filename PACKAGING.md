@@ -26,6 +26,7 @@ This writes:
 
 ```text
 dist/msword-use-windows/
+  install-windows.cmd
   install-windows.ps1
   msword-use_0.1.0_x64-setup.exe
   msword-use_0.1.0_x64_en-US.msi
@@ -101,6 +102,7 @@ For distribution without the repo, put these two files in the same folder or
 zip them together:
 
 ```text
+install-windows.cmd
 install-windows.ps1
 msword-use_0.1.0_x64-setup.exe
 msword-use_0.1.0_x64_en-US.msi
@@ -109,13 +111,17 @@ msword-use_0.1.0_x64_en-US.msi
 Then run:
 
 ```powershell
-.\install-windows.ps1 -Endpoint "https://your-anthropic-compatible-endpoint.example" -ApiKey "replace-me"
+.\install-windows.cmd -Endpoint "https://your-anthropic-compatible-endpoint.example" -ApiKey "replace-me"
 ```
+
+Use the `.cmd` wrapper for normal installs. It runs the PowerShell installer
+with `-ExecutionPolicy Bypass` for that process only, so it works on machines
+that block direct `.ps1` execution.
 
 To force the traditional MSI installer path:
 
 ```powershell
-.\install-windows.ps1 -UseMsi -Endpoint "https://your-anthropic-compatible-endpoint.example" -ApiKey "replace-me"
+.\install-windows.cmd -UseMsi -Endpoint "https://your-anthropic-compatible-endpoint.example" -ApiKey "replace-me"
 ```
 
 The `.msi` can also be double-clicked directly. In that mode Windows Installer

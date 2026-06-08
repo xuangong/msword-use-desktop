@@ -6,6 +6,7 @@ const nsisDir = join(repo, "apps", "desktop", "src-tauri", "target", "release", 
 const msiDir = join(repo, "apps", "desktop", "src-tauri", "target", "release", "bundle", "msi");
 const distDir = join(repo, "dist", "msword-use-windows");
 const installScript = join(repo, "scripts", "install-windows.ps1");
+const installCmd = join(repo, "scripts", "install-windows.cmd");
 
 const setupExe = latestSetupExe(nsisDir);
 const msi = latestByExt(msiDir, ".msi");
@@ -16,19 +17,23 @@ mkdirSync(distDir, { recursive: true });
 cpSync(setupExe, join(distDir, basename(setupExe)));
 cpSync(msi, join(distDir, basename(msi)));
 cpSync(installScript, join(distDir, "install-windows.ps1"));
+cpSync(installCmd, join(distDir, "install-windows.cmd"));
 
 writeFileSync(
   join(distDir, "README.txt"),
   [
     "msword-use Windows install package",
     "",
-    "Run from PowerShell:",
+    "Recommended install command:",
     "",
-    '  .\\install-windows.ps1 -Endpoint "https://your-endpoint.example" -ApiKey "replace-me"',
+    '  .\\install-windows.cmd -Endpoint "https://your-endpoint.example" -ApiKey "replace-me"',
+    "",
+    "The .cmd wrapper is included because many Windows machines block direct .ps1 execution by policy.",
+    "It runs install-windows.ps1 with -ExecutionPolicy Bypass for this process only.",
     "",
     "To install through MSI instead of the setup exe:",
     "",
-    '  .\\install-windows.ps1 -UseMsi -Endpoint "https://your-endpoint.example" -ApiKey "replace-me"',
+    '  .\\install-windows.cmd -UseMsi -Endpoint "https://your-endpoint.example" -ApiKey "replace-me"',
     "",
     "You can also double-click the .msi for a traditional install, then create:",
     "",
@@ -38,7 +43,7 @@ writeFileSync(
     "",
     "  $env:MSWORD_USE_ENDPOINT = \"https://your-endpoint.example\"",
     "  $env:MSWORD_USE_API_KEY = \"replace-me\"",
-    "  .\\install-windows.ps1 -UseMsi -Silent",
+    "  .\\install-windows.cmd -UseMsi -Silent",
     "",
     "The API key is written to %APPDATA%\\msword-use\\config.json for the current Windows user.",
   ].join("\r\n") + "\r\n",
