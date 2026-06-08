@@ -940,7 +940,7 @@ export default function App() {
 
   return (
     <main className="h-full flex flex-col bg-neutral-50 text-neutral-900">
-      <header className="px-4 py-3 border-b border-neutral-200 bg-white flex items-center gap-2 shrink-0 overflow-hidden">
+      <header className="px-4 py-3 border-b border-neutral-200 bg-white flex items-center gap-2 shrink-0">
         <div className="flex items-baseline gap-2 shrink-0 min-w-0">
           <h1 className="text-lg font-semibold whitespace-nowrap">msword-use</h1>
           <p className="hidden lg:block text-xs text-neutral-500 whitespace-nowrap">
