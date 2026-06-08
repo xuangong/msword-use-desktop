@@ -57,7 +57,10 @@ export default function SpotlightApp() {
   const [hint, setHint] = useState<string>("");
   const [skills, setSkills] = useState<SkillEntry[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
   const pendingChatId = useRef<string | null>(null);
+  const skillsRequested = useRef(false);
+  const skillsPollTimer = useRef<number | null>(null);
 
   const commands = useMemo(() => buildCommands(skills), [skills]);
   const palette = useCommandPalette({
@@ -77,10 +80,92 @@ export default function SpotlightApp() {
     setTimeout(() => inputRef.current?.focus(), 30);
   }, []);
 
+  const applySkillsList = useCallback((msg: any) => {
+    if (msg.kind !== "skills:list" || !Array.isArray(msg.skills)) return false;
+    setSkills(msg.skills as SkillEntry[]);
+    skillsRequested.current = false;
+    dlog("skills loaded", msg.skills.length);
+    return true;
+  }, []);
+
   // Register as a reply subscriber so Rust fans out replies to our queue.
   useEffect(() => {
-    invoke("register_subscriber", { name: "spotlight" }).catch(() => {});
+    invoke("register_subscriber", { name: "spotlight" })
+      .then(() => requestSkillsList())
+      .catch(() => requestSkillsList());
   }, []);
+
+  useEffect(() => {
+    return () => {
+      if (skillsPollTimer.current != null) {
+        window.clearTimeout(skillsPollTimer.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    const root = rootRef.current;
+    if (!root) return;
+
+    let raf = 0;
+    const resize = () => {
+      window.cancelAnimationFrame(raf);
+      raf = window.requestAnimationFrame(() => {
+        const height = Math.ceil(root.getBoundingClientRect().height);
+        invoke("spotlight_resize", { height: Math.max(92, Math.min(320, height)) }).catch(() => {});
+      });
+    };
+
+    resize();
+    const observer = new ResizeObserver(resize);
+    observer.observe(root);
+    return () => {
+      window.cancelAnimationFrame(raf);
+      observer.disconnect();
+    };
+  }, []);
+
+  function requestSkillsList(force = false) {
+    if (!force && skillsRequested.current) return;
+    skillsRequested.current = true;
+    const id = `skills:${Math.random().toString(36).slice(2, 10)}`;
+
+    if (skillsPollTimer.current != null) {
+      window.clearTimeout(skillsPollTimer.current);
+      skillsPollTimer.current = null;
+    }
+
+    const poll = async (attempt = 0) => {
+      const replies = await invoke<string[]>("spotlight_take_reply", {
+        subscriber: "spotlight",
+        id,
+      }).catch(() => [] as string[]);
+      for (const raw of replies) {
+        try {
+          if (applySkillsList(JSON.parse(raw))) return;
+        } catch {
+          /* ignore */
+        }
+      }
+      if (attempt >= 30 || !skillsRequested.current) {
+        skillsRequested.current = false;
+        return;
+      }
+      skillsPollTimer.current = window.setTimeout(() => poll(attempt + 1), 100);
+    };
+
+    invoke("bun_send", {
+      line: JSON.stringify({ kind: "list-skills", id }),
+    })
+      .then(() => {
+        skillsPollTimer.current = window.setTimeout(() => poll(), 50);
+      })
+      .catch((err) => {
+        skillsRequested.current = false;
+        dlog("list-skills failed", String(err));
+        skillsPollTimer.current = window.setTimeout(() => requestSkillsList(true), 500);
+      });
+  }
 
   useEffect(() => {
     /** Apply a new invocation context: reset state. The paragraph snapshot
@@ -119,10 +204,14 @@ export default function SpotlightApp() {
       try {
         const msg = JSON.parse(payload);
 
+        if (msg.ready === true) {
+          requestSkillsList(true);
+          return;
+        }
+
         // Sidecar pushes its skills inventory at startup and after every
         // reload — track it so the command palette stays in sync.
-        if (msg.kind === "skills:list" && Array.isArray(msg.skills)) {
-          setSkills(msg.skills as SkillEntry[]);
+        if (applySkillsList(msg)) {
           return;
         }
 
@@ -147,7 +236,7 @@ export default function SpotlightApp() {
       offInvoke();
       offReply();
     };
-  }, [reset]);
+  }, [reset, applySkillsList]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -166,6 +255,7 @@ export default function SpotlightApp() {
   useEffect(() => {
     const onVis = () => {
       if (document.visibilityState !== "visible") return;
+      if (skills.length === 0) requestSkillsList(true);
       invoke<SpotlightInvoke | null>("spotlight_get_invoke")
         .then((payload) => {
           dlog("visibility pull", payload);
@@ -184,7 +274,7 @@ export default function SpotlightApp() {
     };
     document.addEventListener("visibilitychange", onVis);
     return () => document.removeEventListener("visibilitychange", onVis);
-  }, [reset]);
+  }, [reset, skills.length]);
 
   // Robustness fallback: Tauri 2 event delivery to the spotlight webview is
   // unreliable in some configurations. Poll the latest invocation every
@@ -274,7 +364,6 @@ export default function SpotlightApp() {
 
     // Poll the chat event stream from the Rust reply cache. A chat call
     // produces multiple events (text_delta, tool_call, tool_result, done).
-    const start = Date.now();
     let done = false;
     const tick = async () => {
       if (pendingChatId.current !== id) return; // superseded
@@ -293,17 +382,7 @@ export default function SpotlightApp() {
         }
       }
       if (done) return;
-      // Keep polling until done or 60s timeout.
-      if (Date.now() - start < 60_000) {
-        setTimeout(tick, 100);
-      } else {
-        dlog("chat poll timed out");
-        if (pendingChatId.current === id) {
-          setPhase("error");
-          setStatusText("超时");
-          pendingChatId.current = null;
-        }
-      }
+      setTimeout(tick, 100);
     };
     setTimeout(tick, 50);
   }
@@ -350,7 +429,7 @@ export default function SpotlightApp() {
   const showHintLine = !!hint || noSelection;
 
   return (
-    <div className="font-sans" style={{ background: "transparent" }}>
+    <div ref={rootRef} className="font-sans w-[720px] overflow-hidden" style={{ background: "transparent" }}>
       <div className="m-2 rounded-2xl shadow-2xl ring-1 ring-black/10 bg-white/95 backdrop-blur-md overflow-hidden">
         {ctx && ctx.paragraph_index != null && (
           <div

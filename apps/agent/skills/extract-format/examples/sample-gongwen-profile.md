@@ -26,6 +26,96 @@
 
 ---
 
+## 文档结构层级
+
+```text
+L0 document: 国务院通知体公文
+  L1 header/red-head: 段 1-3
+    R1 发文机关红头: 段 1
+    R2 发文字号: 段 2
+    R3 红线分隔: 段 3
+  L1 title-and-recipient: 段 4-5
+    R4 文件标题: 段 4
+    R5 主送机关: 段 5
+  L1 body: 段 6-11
+    R6 正文段落: 段 6、10、11
+    L2 numbered-sections: 段 7-9
+      R7 一级条目标题: 段 7-9
+  L1 closing: 段 12-13
+    R8 落款机关: 段 12
+    R9 成文日期: 段 13
+```
+
+---
+
+## Layer/Role 格式规约
+
+### L1/header · R1. 发文机关红头
+- 适用内容: 公文首页顶部的发文机关名称，通常 1 行。
+- 所属 layer: L1 header/red-head
+- 证据段: 段 1
+- 内容线索: 文档开头；机关名称；红色大字；位于发文字号之前。
+- 格式约束:
+  - alignment: Center
+  - font: 方正小标宋简体
+  - size: 36pt
+  - color: #FF0000
+  - spaceAfter: 6pt
+- 耦合度: 强耦合
+- 套用规则: 同类公文必须保留红色、居中、小标宋系和显著字号。
+- 反例/不要泛化: 机关名称以外的标题不要套红色大字。
+
+### L1/header · R2. 发文字号
+- 适用内容: `国发〔YYYY〕N 号` 这类发文字号。
+- 所属 layer: L1 header/red-head
+- 证据段: 段 2
+- 内容线索: 位于红头下方；包含规范中文六角括号 `〔〕` 和文号。
+- 格式约束:
+  - alignment: Center
+  - font: 仿宋_GB2312
+  - size: 16pt
+  - lineSpacing: fixed-28pt
+  - spaceBefore: 12pt
+  - spaceAfter: 18pt
+- 耦合度: 强耦合
+- 套用规则: 文号内容可变，但居中、六角括号、发文字号位置必须保持。
+- 反例/不要泛化: 普通正文中的编号不使用本规则。
+
+### L1/body · R3. 正文段落
+- 适用内容: 主送机关之后的叙述性正文、说明性正文。
+- 所属 layer: L1 body
+- 证据段: 段 6、10、11
+- 内容线索: 完整叙述句；不承担标题/落款/机关名单功能。
+- 格式约束:
+  - styleName: 正文
+  - alignment: Justify
+  - firstLineIndent: 32pt（2 字符 @ 16pt）
+  - font: 仿宋_GB2312
+  - size: 16pt
+  - lineSpacing: fixed-28pt
+- 耦合度: 弱耦合
+- 套用规则: 新增正文段默认套用此规约。
+- 反例/不要泛化: 段 10 的 15pt 字号异常不进入正文规约。
+
+### L1/body > L2/numbered-sections · R4. 一级条目标题
+- 适用内容: `一、...` / `二、...` / `三、...` 这类正文内一级条目标题。
+- 所属 layer: L1 body > L2 numbered-sections
+- 证据段: 段 7、8、9
+- 内容线索: 中文数字编号 + 顿号；概括后续内容；位于正文中部。
+- 格式约束:
+  - styleName: 标题 2
+  - outlineLevel: 2
+  - listTemplate: 中文一级
+  - font: 黑体
+  - size: 16pt
+  - lineSpacing: fixed-28pt
+  - spaceBefore: 12pt
+- 耦合度: 强耦合
+- 套用规则: 一级条目标题使用黑体 + 中文编号；字号跟随正文主字号。
+- 反例/不要泛化: 段 8 内部单点加粗只保留为该段局部强调，不推广到所有一级条目。
+
+---
+
 ## 段 1
 内容: 国务院
 

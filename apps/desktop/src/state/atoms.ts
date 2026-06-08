@@ -95,7 +95,7 @@ export const appendEventAtom = atom(null, (get, set, ev: DebugEvent) => {
  * Apply one event to the turn list; returns the updated list (or the same
  * reference if the event isn't turn-relevant). Pure for predictability.
  */
-function applyEventToTurns(turns: ChatTurn[], ev: DebugEvent): ChatTurn[] {
+export function applyEventToTurns(turns: ChatTurn[], ev: DebugEvent): ChatTurn[] {
   switch (ev.kind) {
     case "user_message": {
       // Start a new turn keyed by messageId (or the event id).
@@ -108,6 +108,7 @@ function applyEventToTurns(turns: ChatTurn[], ev: DebugEvent): ChatTurn[] {
           startedAt: ev.ts,
           userText: ev.text,
           assistantText: "",
+          blocks: [],
           toolCalls: [],
           stopReason: null,
           streaming: true,
@@ -119,7 +120,15 @@ function applyEventToTurns(turns: ChatTurn[], ev: DebugEvent): ChatTurn[] {
       const idx = lastStreamingIdx(turns);
       if (idx < 0) return turns;
       const out = turns.slice();
-      out[idx] = { ...out[idx]!, assistantText: out[idx]!.assistantText + ev.text };
+      const turn = out[idx]!;
+      const blocks = turn.blocks.slice();
+      const last = blocks[blocks.length - 1];
+      if (last?.kind === "text") {
+        blocks[blocks.length - 1] = { ...last, text: last.text + ev.text };
+      } else {
+        blocks.push({ kind: "text", id: ev.id, text: ev.text });
+      }
+      out[idx] = { ...turn, assistantText: turn.assistantText + ev.text, blocks };
       return out;
     }
     case "tool_call": {
@@ -132,7 +141,18 @@ function applyEventToTurns(turns: ChatTurn[], ev: DebugEvent): ChatTurn[] {
         input: ev.input,
         startedAt: ev.ts,
       };
-      out[idx] = { ...out[idx]!, toolCalls: [...out[idx]!.toolCalls, tc] };
+      const turn = out[idx]!;
+      const hasToolCall = turn.toolCalls.some((t) => t.toolUseId === ev.toolUseId);
+      const hasBlock = turn.blocks.some(
+        (b) => b.kind === "tool" && b.toolUseId === ev.toolUseId,
+      );
+      out[idx] = {
+        ...turn,
+        toolCalls: hasToolCall ? turn.toolCalls : [...turn.toolCalls, tc],
+        blocks: hasBlock
+          ? turn.blocks
+          : [...turn.blocks, { kind: "tool", id: ev.id, toolUseId: ev.toolUseId }],
+      };
       return out;
     }
     case "tool_result": {

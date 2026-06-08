@@ -39,6 +39,21 @@ test("read: loads a real SKILL.md from skills/", async () => {
   expect((r.details as any)?.bytes).toBeGreaterThan(0);
 });
 
+test("read: maps legacy apps/agent/skills path to skills root", async () => {
+  const r = await readTool.execute(
+    "tc1b",
+    { path: "apps/agent/skills/polish-gongwen/SKILL.md" },
+  );
+  const block = r.content[0];
+  expect(block?.type).toBe("text");
+  if (block?.type === "text") {
+    expect(block.text).toContain("name: polish-gongwen");
+  }
+  expect((r.details as any)?.resolvedPath.replace(/\\/g, "/")).toContain(
+    "/skills/polish-gongwen/SKILL.md",
+  );
+});
+
 test("read: path traversal returns error result, not throw", async () => {
   const r = await readTool.execute(
     "tc2",

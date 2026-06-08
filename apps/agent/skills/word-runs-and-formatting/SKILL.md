@@ -28,9 +28,11 @@ Document
 - `Alignment`、`LeftIndent`、`FirstLineIndent`、`SpaceBefore/After`、`LineSpacing`
 - `ListFormat`（编号、缩进等级）
 
-**字符级**（`Range.Font` / `Range.Bold/Italic/Underline` 等）—— `Range.Text =` 会**统一成范围起始位置的格式**，多 run 段落的内部格式**全部丢失**：
-- `Font.Name`、`Font.Size`、`Font.Color`、`Font.ColorIndex`
+**字符级**（`Range.Font` / `Range.Bold/Italic/Underline` 等）—— `Range.Text =` 会**统一成范围起始位置的格式**，多 run 段落的内部格式**全部丢失**。即使是单 run，跨语言写入也可能走 Word 默认字体槽，导致中文字号/字体观感变化，所以写入后要显式恢复完整字体槽：
+- `Font.Name`、`Font.NameAscii`、`Font.NameFarEast`、`Font.NameOther`、`Font.NameBi`
+- `Font.Size`、`Font.SizeBi`、`Font.Color`、`Font.ColorIndex`
 - `Font.Bold`、`Font.Italic`、`Font.Underline`、`Font.UnderlineColor`
+- `Font.BoldBi`、`Font.ItalicBi`
 - `Font.StrikeThrough`、`Font.Subscript`、`Font.Superscript`
 - `Font.Highlight`（背景色）
 - `Font.Spacing`、`Font.Scaling`、`Font.Position`
@@ -40,7 +42,7 @@ Document
 ```
 Step 1: 读目标 range
 Step 2: 检测 range 的 run 分布
-Step 3a: 单 run（整段一种字符格式）→ 直接 Range.Text = "..."（自动继承）
+Step 3a: 单 run（整段一种字符格式）→ 保存完整字体槽 → 只替换段落正文 range → 对同一个正文 range 恢复字体槽
 Step 3b: 多 run（混合格式）→ 走"per-run rewrite"（见下）
 Step 3c: 不确定/复杂 → 用 FormattedText 备份-还原模式（见下）
 ```
@@ -83,12 +85,61 @@ var body = Doc.Range(rng.Start, rng.End - 1); // 去掉 \r
 
 ## 模式 A：单 run 段落（最常见）
 
-直接 `Range.Text =`，字符格式自动继承段首：
+不要裸用 `paragraph.Range.Text =`。先捕获完整字体槽，只替换段落正文 range，替换后对同一个正文 range 恢复。尤其是翻译成中文时，必须恢复 `NameFarEast` 和 `SizeBi`，否则 Word 可能使用默认中文字体/字号。
+
+Track Changes 下必须保留 paragraph mark：
+- 用 `body = Doc.Range(paragraph.Range.Start, paragraph.Range.End - 1)`。
+- 写 `body.Text = newText`。
+- 不要写 `paragraph.Range.Text = newText + "\r"`，否则段落标记也会进入修订，Word 可能把插入/批注显示到修订气泡区域，原文留在下面。
+- 不要在替换后用旧坐标 `start + newText.Length` 重新取 range；TrackRevisions 下旧坐标可能已经指向删除修订。
 
 ```csharp
 Track(() => {
     var rng = Doc.Paragraphs[3].Range;
-    rng.Text = "改写后的内容\r";  // 整段一种格式时，颜色/字号/粗体保留
+    string newText = "改写后的内容";
+
+    var body = Doc.Range(rng.Start, rng.End - 1);
+    var f = body.Characters.Count > 0 ? body.Characters[1].Font : rng.Font;
+
+    var name = f.Name;
+    var nameAscii = f.NameAscii;
+    var nameFarEast = f.NameFarEast;
+    var nameOther = f.NameOther;
+    var nameBi = f.NameBi;
+    var size = f.Size;
+    var sizeBi = f.SizeBi;
+    var bold = f.Bold;
+    var boldBi = f.BoldBi;
+    var italic = f.Italic;
+    var italicBi = f.ItalicBi;
+    var underline = f.Underline;
+    var color = f.Color;
+    var colorIndex = f.ColorIndex;
+    var highlight = f.HighlightColorIndex;
+    var strike = f.StrikeThrough;
+    var sub = f.Subscript;
+    var sup = f.Superscript;
+
+    body.Text = newText;
+
+    body.Font.Name = name;
+    body.Font.NameAscii = nameAscii;
+    body.Font.NameFarEast = nameFarEast;
+    body.Font.NameOther = nameOther;
+    body.Font.NameBi = nameBi;
+    body.Font.Size = size;
+    body.Font.SizeBi = sizeBi;
+    body.Font.Bold = bold;
+    body.Font.BoldBi = boldBi;
+    body.Font.Italic = italic;
+    body.Font.ItalicBi = italicBi;
+    body.Font.Underline = underline;
+    body.Font.Color = color;
+    body.Font.ColorIndex = colorIndex;
+    body.Font.HighlightColorIndex = highlight;
+    body.Font.StrikeThrough = strike;
+    body.Font.Subscript = sub;
+    body.Font.Superscript = sup;
 });
 ```
 
@@ -163,7 +214,12 @@ class RunSpec {
     public Microsoft.Office.Interop.Word.WdUnderline? Underline;
     public int? Color;
     public float? FontSize;
+    public float? FontSizeBi;
     public string FontName;
+    public string FontNameAscii;
+    public string FontNameFarEast;
+    public string FontNameOther;
+    public string FontNameBi;
 }
 
 void WriteRuns(Microsoft.Office.Interop.Word.Range paraRng, List<RunSpec> runs) {
@@ -179,7 +235,12 @@ void WriteRuns(Microsoft.Office.Interop.Word.Range paraRng, List<RunSpec> runs) 
         if (r.Underline.HasValue) written.Font.Underline = r.Underline.Value;
         if (r.Color.HasValue) written.Font.Color = (Microsoft.Office.Interop.Word.WdColor)r.Color.Value;
         if (r.FontSize.HasValue) written.Font.Size = r.FontSize.Value;
+        if (r.FontSizeBi.HasValue) written.Font.SizeBi = r.FontSizeBi.Value;
         if (r.FontName != null) written.Font.Name = r.FontName;
+        if (r.FontNameAscii != null) written.Font.NameAscii = r.FontNameAscii;
+        if (r.FontNameFarEast != null) written.Font.NameFarEast = r.FontNameFarEast;
+        if (r.FontNameOther != null) written.Font.NameOther = r.FontNameOther;
+        if (r.FontNameBi != null) written.Font.NameBi = r.FontNameBi;
         p += r.Text.Length;
     }
 }
@@ -194,7 +255,8 @@ class RunInfo {
     public int Start; public int End;
     public string Text;
     public bool Bold; public bool Italic;
-    public int Color; public float Size; public string Name;
+    public int Color; public float Size; public float SizeBi;
+    public string Name; public string NameAscii; public string NameFarEast; public string NameOther;
 }
 
 List<RunInfo> ScanRuns(Microsoft.Office.Interop.Word.Range rng) {
@@ -211,7 +273,11 @@ List<RunInfo> ScanRuns(Microsoft.Office.Interop.Word.Range rng) {
         Italic = (first.Font.Italic != 0),
         Color = (int)first.Font.Color,
         Size = first.Font.Size,
+        SizeBi = first.Font.SizeBi,
         Name = first.Font.Name,
+        NameAscii = first.Font.NameAscii,
+        NameFarEast = first.Font.NameFarEast,
+        NameOther = first.Font.NameOther,
     };
 
     for (int i = 2; i <= n; i++) {
@@ -221,7 +287,11 @@ List<RunInfo> ScanRuns(Microsoft.Office.Interop.Word.Range rng) {
             (ch.Font.Italic != 0) == cur.Italic &&
             (int)ch.Font.Color == cur.Color &&
             ch.Font.Size == cur.Size &&
-            ch.Font.Name == cur.Name;
+            ch.Font.SizeBi == cur.SizeBi &&
+            ch.Font.Name == cur.Name &&
+            ch.Font.NameAscii == cur.NameAscii &&
+            ch.Font.NameFarEast == cur.NameFarEast &&
+            ch.Font.NameOther == cur.NameOther;
         if (sameFmt) {
             cur.End = ch.End;
             cur.Text += (ch.Text ?? "");
@@ -234,7 +304,11 @@ List<RunInfo> ScanRuns(Microsoft.Office.Interop.Word.Range rng) {
                 Italic = (ch.Font.Italic != 0),
                 Color = (int)ch.Font.Color,
                 Size = ch.Font.Size,
+                SizeBi = ch.Font.SizeBi,
                 Name = ch.Font.Name,
+                NameAscii = ch.Font.NameAscii,
+                NameFarEast = ch.Font.NameFarEast,
+                NameOther = ch.Font.NameOther,
             };
         }
     }
@@ -268,17 +342,19 @@ foreach (var r in runs) {
 - **`Range.Characters[i]` 1-based**
 - **修改 `\r` 的格式无效**：paragraph mark 字符不能加粗
 - **`Doc.Range(s, s)` 是空 range**，可以当 cursor 用，`.Text = ".."` 会在该位置插入
-- **TrackRevisions 下的 run 替换**：每个 `cur.Text = ""` 都会产生一条 deletion 修订，逐 run 写入会产生一串 insertion 修订 —— 用户审阅时看到的是「整段被删 + 整段新插入」，不是逐字符 diff，正常现象
+- **TrackRevisions 下不要替换 paragraph mark**：`paragraph.Range.Text = "...\\r"` 会把段落标记纳入修订，容易造成译文/批注跑到修订气泡区域、原文留在下面。改正文时只写 `Doc.Range(paragraph.Range.Start, paragraph.Range.End - 1).Text = "..."`。
+- **TrackRevisions 下不要用旧坐标套格式**：替换后不要 `Doc.Range(start, start + newText.Length)`；直接对刚写入的正文 range 设置字体。
+- **TrackRevisions 下的 run 替换**：每个 `cur.Text = ""` 都会产生一条 deletion 修订，逐 run 写入会产生一串 insertion 修订。必须保证这些插入发生在原段落正文位置，而不是文档开头、结尾或修订气泡区域。
 
 ## 任务模板
 
 **保格式翻译**（多 run 中文 → 英文）：
 
 1. observe：用 `ScanRuns` 列出原段落 run 分布
-2. 检查 run 数：若只 1 个 → 走模式 A（直接 Range.Text =）
+2. 检查 run 数：若只 1 个 → 走模式 A（只替换段落正文 range）
 3. 若多 run → 在你（LLM）头脑里做语义对齐：原文哪些词粗体/斜体 → 译文中哪几个对应词应该相应格式
 4. 构造 `List<RunSpec>` → 调 `WriteRuns`
-5. 加 `[AI: 翻译保格式]` 批注
+5. 不默认加批注；让 Track Changes 显示每段的实际替换
 
 **保格式 polish**（中文改写）：
 

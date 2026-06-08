@@ -31,7 +31,7 @@ import { buildSystemPrompt } from "./agent/buildSystemPrompt";
 import { SessionRegistry } from "./agent/sessionRegistry";
 import { loadConfig } from "./lib/config";
 import { seedUserData } from "./lib/seedUserData";
-import type { Agent, AgentEvent } from "@earendil-works/pi-agent-core";
+import type { Agent, AgentEvent, AgentMessage } from "@earendil-works/pi-agent-core";
 
 // ---------- Windows path-normalization wrapper for pi's NodeExecutionEnv ----------
 //
@@ -216,6 +216,10 @@ function handleLine(line: string) {
 
   switch (req.kind) {
     case "chat":
+      if (req.mode === "steer" && typeof req.sessionId === "string" && currentPromptId.has(req.sessionId)) {
+        runSteer(req);
+        return;
+      }
       void enqueueChat(() => runChat(req));
       return;
     case "raw":
@@ -250,12 +254,18 @@ function handleLine(line: string) {
 interface PinnedTarget {
   paragraphIndex?: number;
   preview?: string;
+  docName?: string;
+  fullName?: string;
+  selectionStart?: number;
+  selectionEnd?: number;
+  selectionEmpty?: boolean;
 }
 
 interface ChatReq {
   id: string;
   sessionId: string;
   message: string;
+  mode?: "prompt" | "steer";
   pinnedTarget?: PinnedTarget;
 }
 
@@ -265,19 +275,7 @@ async function runChat(req: ChatReq) {
     const agent = registry.getOrCreate(sessionId);
     currentPromptId.set(sessionId, id);
 
-    const targetWrapped = pinnedTarget?.paragraphIndex
-      ? composePromptWithTarget(message, pinnedTarget)
-      : message;
-
-    // /skill:<name>  trailing args  — explicit skill invocation.
-    const expanded = expandSkillCommand(targetWrapped);
-
-    // Prepend a runtime context block listing currently-attached references so
-    // the LLM knows about them every turn. Cheap (a few lines) and avoids relying
-    // on the model to remember prior context across turns.
-    const userText = prependReferenceContext(expanded);
-
-    await agent.prompt(userText);
+    await agent.prompt(prepareUserText(message, pinnedTarget));
   } catch (err: any) {
     process.stderr.write(`[chat] ${sessionId}/${id} failed: ${err?.stack ?? err}\n`);
     write({
@@ -288,6 +286,30 @@ async function runChat(req: ChatReq) {
     });
   } finally {
     currentPromptId.delete(sessionId);
+  }
+}
+
+function runSteer(req: ChatReq) {
+  const { id, sessionId, message, pinnedTarget } = req;
+  try {
+    const agent = registry.getOrCreate(sessionId);
+    const activePromptId = currentPromptId.get(sessionId) ?? null;
+    const userText = prepareUserText(`[补充上下文]\n${message}`, pinnedTarget);
+    agent.steer(toUserMessage(userText));
+    write({
+      sessionId,
+      id,
+      targetId: activePromptId,
+      kind: "chat:steered",
+    });
+  } catch (err: any) {
+    process.stderr.write(`[steer] ${sessionId}/${id} failed: ${err?.stack ?? err}\n`);
+    write({
+      sessionId,
+      id,
+      kind: "error",
+      error: String(err?.message ?? err),
+    });
   }
 }
 
@@ -315,11 +337,39 @@ function expandSkillCommand(message: string): string {
 
 function composePromptWithTarget(message: string, target: PinnedTarget): string {
   const lines = ["[当前操作目标]"];
+  if (target.docName) lines.push(`活动文档: ${target.docName}`);
+  if (target.fullName) lines.push(`文档路径: ${target.fullName}`);
   if (target.paragraphIndex) lines.push(`段落索引: ${target.paragraphIndex}`);
+  if (typeof target.selectionStart === "number" && typeof target.selectionEnd === "number") {
+    const kind = target.selectionEmpty ? "光标" : "选区";
+    lines.push(`${kind}范围: ${target.selectionStart}-${target.selectionEnd}`);
+  }
   if (target.preview) lines.push(`段落预览: ${target.preview}`);
   lines.push("");
   lines.push(message);
   return lines.join("\n");
+}
+
+function prepareUserText(message: string, pinnedTarget?: PinnedTarget): string {
+  const targetWrapped = pinnedTarget?.paragraphIndex
+    ? composePromptWithTarget(message, pinnedTarget)
+    : message;
+
+  // /skill:<name>  trailing args  — explicit skill invocation.
+  const expanded = expandSkillCommand(targetWrapped);
+
+  // Prepend a runtime context block listing currently-attached references so
+  // the LLM knows about them every turn. Cheap (a few lines) and avoids relying
+  // on the model to remember prior context across turns.
+  return prependReferenceContext(expanded);
+}
+
+function toUserMessage(text: string): AgentMessage {
+  return {
+    role: "user",
+    content: [{ type: "text", text }],
+    timestamp: Date.now(),
+  } as AgentMessage;
 }
 
 // ---------- reference documents ----------

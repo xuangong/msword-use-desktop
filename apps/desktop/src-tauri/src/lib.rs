@@ -395,10 +395,8 @@ fn spotlight_hide(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 fn spotlight_resize(app: AppHandle, height: u32) -> Result<(), String> {
     if let Some(w) = app.get_webview_window("spotlight") {
-        let size = w.outer_size().map_err(|e| e.to_string())?;
-        let scale = w.scale_factor().map_err(|e| e.to_string())?;
-        let new_h = ((height as f64) * scale) as u32;
-        w.set_size(tauri::PhysicalSize::new(size.width, new_h))
+        let new_h = height.clamp(92, 320);
+        w.set_size(tauri::LogicalSize::new(720.0, new_h as f64))
             .map_err(|e| e.to_string())?;
     }
     Ok(())

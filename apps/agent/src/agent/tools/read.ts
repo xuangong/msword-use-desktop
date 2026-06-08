@@ -13,13 +13,13 @@
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import { Type, type Static } from "typebox";
 import { readFile, stat } from "node:fs/promises";
-import { resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { resolveAllowedRoots } from "../skillsRoot";
 
 const ReadParams = Type.Object({
   path: Type.String({
     description:
-      "File path to read. Must resolve under apps/agent/skills/ or apps/agent/docs/. " +
+      "File path to read. Must resolve under the msword-use skills/ or docs/ roots. " +
       "You can use the absolute paths shown in <available_skills> location fields, " +
       "or relative paths like 'skills/polish-gongwen/SKILL.md'.",
   }),
@@ -59,10 +59,7 @@ export const readTool: AgentTool<typeof ReadParams, ReadDetails | null> = {
     // protocol-level errors.
     const roots = resolveAllowedRoots();
 
-    // Resolve relative paths against the parent of both roots (i.e. apps/agent)
-    // so requests like "skills/polish-gongwen/SKILL.md" work naturally.
-    const appAgentDir = resolve(roots.skills, "..");
-    const resolved = resolve(appAgentDir, requested);
+    const resolved = resolveRequestedPath(requested, roots);
 
     const allowed =
       isUnder(resolved, roots.skills) || isUnder(resolved, roots.docs);
@@ -102,6 +99,36 @@ export const readTool: AgentTool<typeof ReadParams, ReadDetails | null> = {
     };
   },
 };
+
+function resolveRequestedPath(requested: string, roots: { skills: string; docs: string }): string {
+  const normalized = requested.replace(/\\/g, "/").replace(/^\/+/, "");
+
+  // Historical prompts and pi skill locations may mention bundled repo paths
+  // like apps/agent/skills/foo/SKILL.md. Runtime reads should target the seeded
+  // user-data roots instead: %APPDATA%/msword-use/skills and docs.
+  const legacySkillPrefix = "apps/agent/skills/";
+  if (normalized.startsWith(legacySkillPrefix)) {
+    return resolve(roots.skills, normalized.slice(legacySkillPrefix.length));
+  }
+  const legacyDocsPrefix = "apps/agent/docs/";
+  if (normalized.startsWith(legacyDocsPrefix)) {
+    return resolve(roots.docs, normalized.slice(legacyDocsPrefix.length));
+  }
+  if (normalized.startsWith("skills/")) {
+    return resolve(roots.skills, normalized.slice("skills/".length));
+  }
+  if (normalized.startsWith("docs/")) {
+    return resolve(roots.docs, normalized.slice("docs/".length));
+  }
+
+  if (isAbsolute(requested)) {
+    return resolve(requested);
+  }
+
+  // Bare relative paths remain rooted at the parent of skills/docs for backward
+  // compatibility with older tests and prompts.
+  return resolve(resolve(roots.skills, ".."), requested);
+}
 
 function isUnder(child: string, parent: string): boolean {
   // Normalise both via resolve() already done by caller. On Windows, paths

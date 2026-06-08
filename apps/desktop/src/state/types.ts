@@ -87,6 +87,8 @@ export interface ChatTurn {
   userText: string;
   /** Streaming-aggregated text from the agent (concat of text_delta events). */
   assistantText: string;
+  /** Ordered assistant content blocks. Preserves text/tool interleaving. */
+  blocks: ChatContentBlock[];
   /** Tool calls in arrival order. ToolCall.result fills in when tool_result arrives. */
   toolCalls: ToolCall[];
   /** stop_reason of the agent turn (set on `done`). null = still in progress. */
@@ -96,6 +98,10 @@ export interface ChatTurn {
   /** True until we see a `done` event for this turn. */
   streaming: boolean;
 }
+
+export type ChatContentBlock =
+  | { kind: "text"; id: string; text: string }
+  | { kind: "tool"; id: string; toolUseId: string };
 
 export interface ToolCall {
   toolUseId: string;
@@ -116,8 +122,12 @@ export interface ToolCall {
 export interface WordContextSnapshot {
   /** Document name (e.g. "gongwen_sample.docx"). */
   docName?: string | null;
+  /** Full path of the active document, when Word exposes it. */
+  fullName?: string | null;
   /** Total documents open in this Word instance. */
   docCount?: number;
+  /** Total paragraphs in the active document. */
+  paragraphCount?: number;
   /** Word version (e.g. "16.0"). */
   version?: string;
   /** Trigger window title captured by Rust at hotkey time. */
@@ -126,6 +136,13 @@ export interface WordContextSnapshot {
   triggerClass?: string;
   /** Selection text — null if no selection. */
   selectionText?: string | null;
+  /** Whether Word reports the selection as empty/caret-only. */
+  selectionEmpty?: boolean;
+  /** Character offsets of the current selection in the active document. */
+  selectionStart?: number | null;
+  selectionEnd?: number | null;
+  /** Preview of the paragraph containing the selection/caret. */
+  paragraphPreview?: string | null;
   /** 1-based paragraph index of the selection start. */
   paragraphIndex?: number | null;
   /** Last refresh timestamp. */

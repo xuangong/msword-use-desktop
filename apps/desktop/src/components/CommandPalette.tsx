@@ -122,7 +122,7 @@ export function useCommandPalette(props: PaletteProps): PaletteHandle & { render
       );
     }
     return (
-      <div ref={listRef} className="border-b border-neutral-100 max-h-64 overflow-y-auto">
+      <div ref={listRef} className="border-b border-neutral-100 max-h-48 overflow-y-auto">
         {filtered.map((cmd, i) => (
           <button
             key={cmd.fill}

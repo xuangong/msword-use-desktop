@@ -42,6 +42,7 @@ import {
 } from "./components/CommandPalette";
 import { piEventToDebugEvent } from "./state/piEventBridge";
 import type { ChatTurn, DebugEvent, DebugEventKind, ToolCall, WordContextSnapshot } from "./state/types";
+import { rawCall } from "./rpc";
 
 function rid(): string {
   return Math.random().toString(36).slice(2, 10);
@@ -132,10 +133,147 @@ interface ReferenceInfo {
   paragraphs: number;
 }
 
+const WORD_CONTEXT_SCRIPT = `
+if (App == null || Doc == null) {
+    return new {
+        ok = false,
+        error = "Word is not attached",
+        docName = (string)null,
+        fullName = (string)null,
+        docCount = 0,
+        version = (string)null,
+        paragraphCount = 0,
+        paragraphIndex = (int?)null,
+        paragraphPreview = "",
+        selectionText = (string)null,
+        selectionEmpty = true,
+        selectionStart = (int?)null,
+        selectionEnd = (int?)null
+    };
+}
+
+var sel = App.Selection;
+int? idx = null;
+int? selStart = null;
+int? selEnd = null;
+string selText = null;
+bool selectionEmpty = true;
+try {
+    if (sel != null && sel.Range != null) {
+        selStart = sel.Range.Start;
+        selEnd = sel.Range.End;
+        selectionEmpty = sel.Range.Start == sel.Range.End;
+        selText = (sel.Text ?? "").Trim('\\r', '\\n', '\\x07');
+        for (int i = 1; i <= Doc.Paragraphs.Count; i++) {
+            var r = Doc.Paragraphs[i].Range;
+            if (sel.Range.Start >= r.Start && sel.Range.Start <= r.End) {
+                idx = i;
+                break;
+            }
+        }
+    }
+} catch { }
+
+string preview = "";
+if (idx.HasValue) {
+    var t = (Doc.Paragraphs[idx.Value].Range.Text ?? "").Trim('\\r', '\\n', '\\x07', ' ', '\\t');
+    preview = t.Length > 120 ? t.Substring(0, 120) : t;
+}
+
+return new {
+    ok = true,
+    error = (string)null,
+    docName = Doc.Name,
+    fullName = Doc.FullName,
+    docCount = App.Documents.Count,
+    version = App.Version,
+    paragraphCount = Doc.Paragraphs.Count,
+    paragraphIndex = idx,
+    paragraphPreview = preview,
+    selectionText = selText,
+    selectionEmpty = selectionEmpty,
+    selectionStart = selStart,
+    selectionEnd = selEnd
+};
+`;
+
+interface WordContextResult {
+  ok?: boolean;
+  error?: string | null;
+  docName?: string | null;
+  fullName?: string | null;
+  docCount?: number;
+  version?: string | null;
+  paragraphCount?: number;
+  paragraphIndex?: number | null;
+  paragraphPreview?: string | null;
+  selectionText?: string | null;
+  selectionEmpty?: boolean;
+  selectionStart?: number | null;
+  selectionEnd?: number | null;
+}
+
+function wordPatchFromResult(result: WordContextResult, source: WordContextSnapshot["source"]): Partial<WordContextSnapshot> {
+  return {
+    docName: result.docName ?? null,
+    fullName: result.fullName ?? null,
+    docCount: result.docCount,
+    version: result.version ?? undefined,
+    paragraphCount: result.paragraphCount,
+    selectionText: result.selectionText ?? null,
+    selectionEmpty: result.selectionEmpty,
+    selectionStart: result.selectionStart ?? null,
+    selectionEnd: result.selectionEnd ?? null,
+    paragraphIndex: result.paragraphIndex ?? null,
+    paragraphPreview: result.paragraphPreview ?? null,
+    error: result.ok === false ? result.error ?? "Word context unavailable" : undefined,
+    source,
+  };
+}
+
+function pinnedTargetFromCtx(ctx: WordContextSnapshot | null): Record<string, unknown> | undefined {
+  if (!ctx || typeof ctx.paragraphIndex !== "number") return undefined;
+  return {
+    paragraphIndex: ctx.paragraphIndex,
+    docName: ctx.docName ?? undefined,
+    fullName: ctx.fullName ?? undefined,
+    selectionStart: ctx.selectionStart ?? undefined,
+    selectionEnd: ctx.selectionEnd ?? undefined,
+    selectionEmpty: ctx.selectionEmpty,
+    preview: ctx.paragraphPreview ?? ctx.selectionText ?? undefined,
+  };
+}
+
+function threadStatus(args: { pending: boolean; events: DebugEvent[]; turns: ChatTurn[] }): string {
+  const { pending, events, turns } = args;
+  const lastTurn = turns[turns.length - 1];
+  let runningTool: ToolCall | undefined;
+  if (lastTurn) {
+    for (let i = lastTurn.toolCalls.length - 1; i >= 0; i--) {
+      const tc = lastTurn.toolCalls[i]!;
+      if (tc.result === undefined) {
+        runningTool = tc;
+        break;
+      }
+    }
+  }
+  if (pending && runningTool) return `执行 ${runningTool.name}`;
+  for (let i = events.length - 1; i >= 0; i--) {
+    const ev = events[i]!;
+    if (ev.kind === "tool_call" && pending) return `执行 ${ev.name}`;
+    if (ev.kind === "tool_result" && pending) return "处理工具结果";
+    if (ev.kind === "text_delta" && pending) return "LLM 回复中";
+    if (ev.kind === "error") return "失败";
+    if (ev.kind === "done") return pending ? "收尾中" : "完成";
+    if (ev.kind === "user_message" && pending) return "等待 LLM";
+  }
+  return pending ? "运行中" : "空闲";
+}
+
 export default function App() {
   const [input, setInput] = useState("");
   const [lastSent, setLastSent] = useState("");
-  const [pending, setPending] = useState(false);
+  const [pendingRequests, setPendingRequests] = useState<Map<string, string>>(() => new Map());
   const [driverGen, setDriverGen] = useState<number | null>(null);
   const [driverReady, setDriverReady] = useState(false);
   const [skills, setSkills] = useState<SkillEntry[]>([]);
@@ -171,6 +309,97 @@ export default function App() {
   const polledIds = useRef<Set<string>>(new Set());
   /** Raw pi events already ingested. Guards against duplicate IPC delivery. */
   const seenAgentEvents = useRef<Map<string, number>>(new Map());
+  const pendingCount = useMemo(() => {
+    if (!currentSessionId) return pendingRequests.size;
+    let count = 0;
+    for (const sid of pendingRequests.values()) {
+      if (sid === currentSessionId) count++;
+    }
+    return count;
+  }, [currentSessionId, pendingRequests]);
+  const pending = pendingCount > 0;
+  const statusText = useMemo(() => threadStatus({ pending, events, turns }), [pending, events, turns]);
+
+  function markPending(requestId: string, sid: string) {
+    setPendingRequests((prev) => {
+      const next = new Map(prev);
+      next.set(requestId, sid);
+      return next;
+    });
+  }
+
+  function markDone(requestId: string | null | undefined) {
+    if (!requestId) return;
+    setPendingRequests((prev) => {
+      if (!prev.has(requestId)) return prev;
+      const next = new Map(prev);
+      next.delete(requestId);
+      return next;
+    });
+  }
+
+  function markSessionDone(sid: string) {
+    setPendingRequests((prev) => {
+      let changed = false;
+      const next = new Map(prev);
+      for (const [requestId, requestSid] of next) {
+        if (requestSid === sid) {
+          next.delete(requestId);
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }
+
+  async function refreshWordContext(
+    sid: string,
+    source: WordContextSnapshot["source"] = "manual",
+  ): Promise<WordContextSnapshot | null> {
+    try {
+      const result = (await rawCall(WORD_CONTEXT_SCRIPT)) as WordContextResult;
+      const patch = wordPatchFromResult(result, source);
+      setWordCtx({ sessionId: sid, patch });
+      return { ...(wordCtx ?? {}), ...patch, refreshedAt: Date.now() };
+    } catch (err) {
+      setWordCtx({
+        sessionId: sid,
+        patch: {
+          error: `context refresh failed: ${String(err)}`,
+          source,
+        },
+      });
+      return wordCtx ?? null;
+    }
+  }
+
+  async function stopCurrentThread() {
+    if (!currentSessionId || !pending) return;
+    try {
+      await invoke("bun_send", {
+        line: JSON.stringify({ kind: "abort", sessionId: currentSessionId }),
+      });
+      appendEvent({
+        id: rid(),
+        ts: Date.now(),
+        sessionId: currentSessionId,
+        kind: "system",
+        text: "已请求停止当前 thread",
+        severity: "warn",
+      });
+    } catch (err) {
+      appendEvent({
+        id: rid(),
+        ts: Date.now(),
+        sessionId: currentSessionId,
+        kind: "system",
+        text: `停止失败: ${err}`,
+        severity: "error",
+      });
+    } finally {
+      markSessionDone(currentSessionId);
+    }
+  }
 
   // ---- IPC ingestion ----
 
@@ -238,6 +467,7 @@ export default function App() {
         kind: "user_message",
         text: message,
       });
+      markPending(id, sid);
       startPollChat(id, sid);
     });
     return () => {
@@ -258,6 +488,12 @@ export default function App() {
       })
       .catch(() => {});
   }, []);
+
+  useEffect(() => {
+    if (!currentSessionId || !driverReady) return;
+    void refreshWordContext(currentSessionId, "manual");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentSessionId, driverReady]);
 
   function handleSidecarReply(msg: any) {
     // Prefer sessionId carried in the envelope (pi-shaped events). Fall back
@@ -318,6 +554,28 @@ export default function App() {
       setReferences(msg.references as ReferenceInfo[]);
       return;
     }
+    if (msg.kind === "chat:steered") {
+      markDone(msg.id);
+      appendEvent({
+        id: rid(),
+        ts: Date.now(),
+        sessionId: sid,
+        messageId: msg.id,
+        kind: "done",
+        stopReason: "steered",
+        finalText: "",
+      });
+      appendEvent({
+        id: rid(),
+        ts: Date.now(),
+        sessionId: sid,
+        messageId: msg.id,
+        kind: "system",
+        text: `补充上下文已插入当前 loop${msg.targetId ? ` (${msg.targetId})` : ""}`,
+        severity: "info",
+      });
+      return;
+    }
     if (msg.kind === "reference:attached" && msg.reference) {
       const r = msg.reference as ReferenceInfo;
       appendEvent({
@@ -354,9 +612,10 @@ export default function App() {
       );
       if (debugEv) {
         appendEvent(debugEv);
-        // Mark turn as no-longer-pending when we see a terminal event.
+        // Mark only this request as no-longer-pending. Supplemental messages
+        // may already be queued for the same session.
         if (debugEv.kind === "done" || debugEv.kind === "error") {
-          setPending(false);
+          markDone(reqId);
         }
         // Side effects for tool_call inputs and tool_result previews —
         // preserved from the v0.3 ingest path because the spotlight UI relies
@@ -383,6 +642,7 @@ export default function App() {
               },
             });
           }
+          void refreshWordContext(sid, "post-chat");
         }
       }
       return;
@@ -391,11 +651,13 @@ export default function App() {
     // Raw response (sidecar broadcasts driver RPC results). The spotlight
     // window consumes its own raw replies; main window can ignore.
     if (msg.kind === "raw_response") {
+      markDone(msg.id);
       return;
     }
 
     // Driver RPC reply (raw) — kept for `/<method>` slash-command flow.
     if (msg.id && msg.result != null) {
+      markDone(msg.id);
       appendEvent({
         id: rid(),
         ts: Date.now(),
@@ -406,6 +668,7 @@ export default function App() {
         error: null,
       });
     } else if (msg.error) {
+      markDone(msg.id);
       appendEvent({
         id: rid(),
         ts: Date.now(),
@@ -422,7 +685,6 @@ export default function App() {
   function startPollChat(chatId: string, sid: string) {
     if (polledIds.current.has(chatId)) return;
     polledIds.current.add(chatId);
-    const start = Date.now();
     let done = false;
     const tick = async () => {
       if (done) return;
@@ -439,8 +701,11 @@ export default function App() {
           // a second time would double-append every text_delta. The polling
           // path exists ONLY to drain this subscriber queue (otherwise it grows
           // unbounded) and to detect the agent_end / error stop signal so we
-          // can flip `pending` off and clean up.
+          // can clean up this request's pending marker.
           if (msg.id) idToSession.current.set(msg.id, sid);
+          if (msg.kind === "chat:steered" || msg.kind === "raw_response" || msg.kind === "error") {
+            done = true;
+          }
           // Pi-shaped events use `event.type`; v0.3 used `event.kind`. Accept both
           // for resilience while the bridge phase settles.
           if (msg.kind === "agent_event") {
@@ -451,11 +716,11 @@ export default function App() {
           }
         } catch { /* ignore */ }
       }
-      if (!done && Date.now() - start < 60_000) {
+      if (!done) {
         setTimeout(tick, 100);
       } else {
         polledIds.current.delete(chatId);
-        setPending(false);
+        markDone(chatId);
       }
     };
     setTimeout(tick, 50);
@@ -466,6 +731,7 @@ export default function App() {
   async function send(textOverride?: string) {
     const line = (textOverride ?? input).trim();
     if (!line) return;
+    const wasPending = pending;
     if (!textOverride) setInput("");
     setLastSent(line);
 
@@ -510,9 +776,18 @@ export default function App() {
         kind: "user_message",
         text: line,
       });
-      setPending(true);
-      const payload = { kind: "chat", id, sessionId: sid, message: line };
+      markPending(id, sid);
       try {
+        const ctxForRequest = await refreshWordContext(sid, "manual");
+        const pinnedTarget = pinnedTargetFromCtx(ctxForRequest ?? wordCtx);
+        const payload: any = {
+          kind: "chat",
+          id,
+          sessionId: sid,
+          mode: wasPending ? "steer" : "prompt",
+          message: line,
+        };
+        if (pinnedTarget) payload.pinnedTarget = pinnedTarget;
         await invoke("bun_send", { line: JSON.stringify(payload) });
         startPollChat(id, sid);
       } catch (err) {
@@ -524,7 +799,7 @@ export default function App() {
           text: `invoke failed: ${err}`,
           severity: "error",
         });
-        setPending(false);
+        markDone(id);
       }
       return;
     }
@@ -554,7 +829,7 @@ export default function App() {
         params,
         requestId: id,
       });
-      setPending(true);
+      markPending(id, sid);
       try {
         await invoke("bun_send", { line: JSON.stringify(payload) });
       } catch (err) {
@@ -566,7 +841,7 @@ export default function App() {
           text: `invoke failed: ${err}`,
           severity: "error",
         });
-        setPending(false);
+        markDone(id);
       }
     } else {
       appendEvent({
@@ -577,9 +852,18 @@ export default function App() {
         kind: "user_message",
         text: line,
       });
-      setPending(true);
-      const payload = { kind: "chat", id, sessionId: sid, message: line };
+      markPending(id, sid);
       try {
+        const ctxForRequest = await refreshWordContext(sid, "manual");
+        const pinnedTarget = pinnedTargetFromCtx(ctxForRequest ?? wordCtx);
+        const payload: any = {
+          kind: "chat",
+          id,
+          sessionId: sid,
+          mode: wasPending ? "steer" : "prompt",
+          message: line,
+        };
+        if (pinnedTarget) payload.pinnedTarget = pinnedTarget;
         await invoke("bun_send", { line: JSON.stringify(payload) });
         startPollChat(id, sid);
       } catch (err) {
@@ -591,7 +875,7 @@ export default function App() {
           text: `invoke failed: ${err}`,
           severity: "error",
         });
-        setPending(false);
+        markDone(id);
       }
     }
   }
@@ -656,9 +940,13 @@ export default function App() {
 
   return (
     <main className="h-full flex flex-col bg-neutral-50 text-neutral-900">
-      <header className="px-4 py-3 border-b border-neutral-200 bg-white flex items-baseline gap-3 shrink-0">
-        <h1 className="text-lg font-semibold">msword-use</h1>
-        <p className="text-xs text-neutral-500">v2-alpha · 自然语言操作 Word · 修订模式</p>
+      <header className="px-4 py-3 border-b border-neutral-200 bg-white flex items-center gap-2 shrink-0 overflow-hidden">
+        <div className="flex items-baseline gap-2 shrink-0 min-w-0">
+          <h1 className="text-lg font-semibold whitespace-nowrap">msword-use</h1>
+          <p className="hidden lg:block text-xs text-neutral-500 whitespace-nowrap">
+            v2-alpha · 自然语言操作 Word · 修订模式
+          </p>
+        </div>
         <div className="relative shrink-0">
           <button
             type="button"
@@ -703,12 +991,17 @@ export default function App() {
             ))}
           </select>
         )}
-        {wordCtx && <WordCtxBar ctx={wordCtx} />}
-        <div className="flex items-center gap-1.5 flex-wrap">
+        <WordCtxBar
+          ctx={wordCtx}
+          onRefresh={() => {
+            if (currentSessionId && driverReady) void refreshWordContext(currentSessionId, "manual");
+          }}
+        />
+        <div className="hidden xl:flex items-center gap-1.5 shrink-0 overflow-hidden max-w-[20rem]">
           {references.map((r) => (
             <span
               key={r.name}
-              className="text-xs bg-emerald-50 border border-emerald-200 rounded px-1.5 py-0.5 text-emerald-800 flex items-center gap-1"
+              className="text-xs bg-emerald-50 border border-emerald-200 rounded px-1.5 py-0.5 text-emerald-800 flex items-center gap-1 shrink-0"
               title={r.path}
             >
               <span>📎</span>
@@ -734,7 +1027,7 @@ export default function App() {
             + 参考文档
           </button>
         </div>
-        <div className="ml-auto flex items-center gap-3 text-xs">
+        <div className="ml-auto flex items-center gap-3 text-xs shrink-0">
           <button
             type="button"
             onClick={clearAll}
@@ -753,7 +1046,7 @@ export default function App() {
             />
             驱动 {driverReady ? `gen=${driverGen ?? "?"}` : <BootTimer startedAt={mountedAt.current} />}
           </span>
-          <span className="text-neutral-400">
+          <span className="hidden 2xl:inline text-neutral-400 whitespace-nowrap">
             指令前加 <code className="bg-neutral-100 px-1 rounded">/</code> 走原始 RPC
           </span>
         </div>
@@ -782,36 +1075,61 @@ export default function App() {
           >
             {palette.render()}
             <div className="flex gap-2 items-center">
-            <input
-              ref={inputRef}
-              autoFocus
-              value={input}
-              onChange={(e) => setInput(e.currentTarget.value)}
-              onKeyDown={(e) => {
-                // Palette consumes ArrowUp/Down/Tab/Enter when open; otherwise
-                // falls through to form submit on Enter.
-                palette.handleKey(e);
-              }}
-              placeholder={pending ? "等待回复..." : "请说... (输入 / 看命令；/ping 走原始 RPC)"}
-              disabled={pending}
-              className="flex-1 border border-neutral-300 rounded px-3 py-2 text-sm disabled:opacity-50"
-            />
-            {!pending && lastSent && !input && (
-              <button
-                type="button"
-                onClick={() => send(lastSent)}
-                className="px-3 py-2 text-xs text-neutral-600 border border-neutral-300 rounded hover:bg-neutral-50"
+              <input
+                ref={inputRef}
+                autoFocus
+                value={input}
+                onChange={(e) => setInput(e.currentTarget.value)}
+                onKeyDown={(e) => {
+                  // Palette consumes ArrowUp/Down/Tab/Enter when open; otherwise
+                  // falls through to form submit on Enter.
+                  palette.handleKey(e);
+                }}
+                placeholder={pending ? "运行中，可继续补充上下文..." : "请说... (输入 / 看命令；/ping 走原始 RPC)"}
+                className="flex-1 border border-neutral-300 rounded px-3 py-2 text-sm"
+              />
+              <span
+                className={
+                  "shrink-0 text-xs min-w-[5.5rem] " +
+                  (pending ? "text-amber-700" : "text-neutral-500")
+                }
+                title="当前 thread 状态"
               >
-                ↻ 重试
+                <span
+                  className={
+                    "inline-block w-1.5 h-1.5 rounded-full mr-1 " +
+                    (pending ? "bg-amber-500 animate-pulse" : "bg-neutral-300")
+                  }
+                />
+                {pendingCount > 1 ? `${statusText} +${pendingCount - 1}` : statusText}
+              </span>
+              {!pending && lastSent && !input && (
+                <button
+                  type="button"
+                  onClick={() => send(lastSent)}
+                  className="px-3 py-2 text-xs text-neutral-600 border border-neutral-300 rounded hover:bg-neutral-50"
+                >
+                  ↻ 重试
+                </button>
+              )}
+              {pending && (
+                <button
+                  type="button"
+                  onClick={() => void stopCurrentThread()}
+                  disabled={!currentSessionId}
+                  className="px-3 py-2 text-xs text-red-700 border border-red-200 rounded hover:bg-red-50 disabled:opacity-30 disabled:hover:bg-transparent"
+                  title="停止当前 thread（请求 agent abort；正在执行的 Word 脚本最多等待驱动超时）"
+                >
+                  停止
+                </button>
+              )}
+              <button
+                type="submit"
+                disabled={!input.trim()}
+                className="px-4 py-2 bg-neutral-900 text-white rounded text-sm disabled:opacity-50"
+              >
+                {pending ? "补充" : "发送"}
               </button>
-            )}
-            <button
-              type="submit"
-              disabled={pending}
-              className="px-4 py-2 bg-neutral-900 text-white rounded text-sm disabled:opacity-50"
-            >
-              发送
-            </button>
             </div>
           </form>
         </div>
@@ -830,6 +1148,13 @@ export default function App() {
 // ============================================================
 
 function TurnView({ turn }: { turn: ChatTurn }) {
+  const toolById = useMemo(() => {
+    const map = new Map<string, ToolCall>();
+    for (const tc of turn.toolCalls) map.set(tc.toolUseId, tc);
+    return map;
+  }, [turn.toolCalls]);
+  const blocks = turn.blocks ?? [];
+
   return (
     <div className="space-y-2">
       <div className="flex justify-end">
@@ -838,21 +1163,33 @@ function TurnView({ turn }: { turn: ChatTurn }) {
         </div>
       </div>
 
-      {turn.toolCalls.map((tc) => (
-        <ToolCallView key={tc.toolUseId} tc={tc} />
-      ))}
+      {blocks.length > 0 ? (
+        blocks.map((block, index) => {
+          if (block.kind === "text") {
+            return (
+              <AssistantTextBlock
+                key={block.id}
+                text={block.text}
+                streaming={turn.streaming && index === blocks.length - 1}
+              />
+            );
+          }
+          const tc = toolById.get(block.toolUseId);
+          return tc ? <ToolCallView key={block.id} tc={tc} /> : null;
+        })
+      ) : (
+        <>
+          {turn.toolCalls.map((tc) => (
+            <ToolCallView key={tc.toolUseId} tc={tc} />
+          ))}
+          {(turn.assistantText || turn.streaming) && (
+            <AssistantTextBlock text={turn.assistantText} streaming={turn.streaming} />
+          )}
+        </>
+      )}
 
-      {(turn.assistantText || turn.streaming) && (
-        <div className="flex justify-start">
-          <div className="max-w-[85%] bg-white border border-neutral-200 rounded-2xl rounded-tl-sm px-4 py-2 text-sm break-words assistant-md">
-            {turn.assistantText
-              ? <Markdown remarkPlugins={[remarkGfm]}>{turn.assistantText}</Markdown>
-              : <span className="text-neutral-400">...</span>}
-            {turn.streaming && turn.assistantText && (
-              <span className="text-neutral-400 animate-pulse">▍</span>
-            )}
-          </div>
-        </div>
+      {turn.streaming && blocks.length > 0 && blocks[blocks.length - 1]?.kind === "tool" && (
+        <AssistantTextBlock text="" streaming />
       )}
 
       {turn.error && (
@@ -860,6 +1197,22 @@ function TurnView({ turn }: { turn: ChatTurn }) {
           ❌ {turn.error}
         </div>
       )}
+    </div>
+  );
+}
+
+function AssistantTextBlock({ text, streaming }: { text: string; streaming: boolean }) {
+  if (!text && !streaming) return null;
+  return (
+    <div className="flex justify-start">
+      <div className="max-w-[85%] bg-white border border-neutral-200 rounded-2xl rounded-tl-sm px-4 py-2 text-sm break-words assistant-md">
+        {text
+          ? <Markdown remarkPlugins={[remarkGfm]}>{text}</Markdown>
+          : <span className="text-neutral-400">...</span>}
+        {streaming && text && (
+          <span className="text-neutral-400 animate-pulse">▍</span>
+        )}
+      </div>
     </div>
   );
 }
@@ -1058,37 +1411,83 @@ function BootTimer({ startedAt }: { startedAt: number }) {
 }
 
 /** Compact "linked to <doc> · 段 N · selection" strip in the header. */
-function WordCtxBar({ ctx }: { ctx: WordContextSnapshot }) {
+function WordCtxBar({
+  ctx,
+  onRefresh,
+}: {
+  ctx: WordContextSnapshot | null;
+  onRefresh: () => void;
+}) {
+  if (!ctx) {
+    return (
+      <button
+        type="button"
+        onClick={onRefresh}
+        className="text-xs text-neutral-500 flex items-center gap-1.5 px-2 py-0.5 bg-neutral-100 rounded hover:bg-neutral-200 shrink min-w-0 whitespace-nowrap"
+        title="刷新当前 Word 文档和选区"
+      >
+        <span>文档未刷新</span>
+      </button>
+    );
+  }
   // Strip the trailing " - Word" so the doc name is short.
   const docName =
     ctx.docName ??
     (ctx.triggerTitle
       ? ctx.triggerTitle.replace(/\s*-\s*(Microsoft\s+)?Word\s*$/i, "")
       : null);
-  if (!docName && !ctx.selectionText) return null;
-  const selPreview = ctx.selectionText
-    ? ctx.selectionText.length > 40
-      ? ctx.selectionText.slice(0, 40) + "…"
-      : ctx.selectionText
+  const selSource = ctx.selectionText || ctx.paragraphPreview || "";
+  const selPreview = selSource
+    ? selSource.length > 40
+      ? selSource.slice(0, 40) + "…"
+      : selSource
     : null;
+  const selectionLabel =
+    ctx.selectionEmpty === false
+      ? ctx.selectionStart != null && ctx.selectionEnd != null
+        ? `选区 ${ctx.selectionStart}-${ctx.selectionEnd}`
+        : "有选区"
+      : ctx.paragraphIndex != null
+        ? "光标"
+        : "无选区";
+  const updated = ctx.refreshedAt ? new Date(ctx.refreshedAt).toLocaleTimeString() : null;
   return (
-    <span className="text-xs text-neutral-500 flex items-center gap-1.5 px-2 py-0.5 bg-neutral-100 rounded">
-      <span>📄</span>
-      <span className="text-neutral-800 font-medium truncate max-w-[160px]">
-        {docName ?? "(未链接)"}
+    <button
+      type="button"
+      onClick={onRefresh}
+      className={
+        "text-xs text-neutral-500 flex items-center gap-1.5 px-2 py-0.5 rounded hover:bg-neutral-200 shrink min-w-0 max-w-[42vw] overflow-hidden whitespace-nowrap " +
+        (ctx.error ? "bg-red-50 text-red-700" : "bg-neutral-100")
+      }
+      title={[
+        ctx.error ? `error: ${ctx.error}` : null,
+        ctx.fullName ?? ctx.triggerTitle ?? null,
+        updated ? `updated: ${updated}` : null,
+      ].filter(Boolean).join("\n")}
+    >
+      <span className="text-neutral-800 font-medium truncate min-w-0 max-w-[12rem]">
+        {docName ?? "(未链接文档)"}
       </span>
+      {ctx.paragraphCount != null && (
+        <>
+          <span className="text-neutral-400 shrink-0">·</span>
+          <span className="shrink-0">{ctx.paragraphCount} 段</span>
+        </>
+      )}
       {ctx.paragraphIndex != null && (
         <>
-          <span className="text-neutral-400">·</span>
-          <span>段 {ctx.paragraphIndex}</span>
+          <span className="text-neutral-400 shrink-0">·</span>
+          <span className="shrink-0">段 {ctx.paragraphIndex}</span>
         </>
       )}
+      <span className="text-neutral-400 shrink-0">·</span>
+      <span className="shrink-0">{selectionLabel}</span>
       {selPreview && (
         <>
-          <span className="text-neutral-400">·</span>
-          <span className="italic text-neutral-600 truncate max-w-[180px]">"{selPreview}"</span>
+          <span className="text-neutral-400 shrink-0">·</span>
+          <span className="italic text-neutral-600 truncate min-w-0 max-w-[12rem]">"{selPreview}"</span>
         </>
       )}
-    </span>
+    </button>
   );
 }
