@@ -1,5 +1,5 @@
 /**
- * Module-level singleton for Tauri sidecar event subscriptions.
+ * Browser-process singleton for Tauri sidecar event subscriptions.
  *
  * Why this exists: Tauri's `listen()` returns Promise<unsubscribe>. If you
  * register from inside a useEffect, the cleanup `void off.then(u => u())`
@@ -14,9 +14,9 @@
  * subscribe/unsubscribe cheaply and idempotently — N mounts of the same
  * effect produce 1 net handler in the Set, not N listeners on Tauri.
  *
- * Side benefit: HMR keeps the Tauri-side listener alive across module
- * reloads (because we never tear it down), so streaming events that arrive
- * during a hot reload are not lost.
+ * The registry lives on globalThis, not in module scope. Vite HMR re-evaluates
+ * this module; module-local state would register another Tauri listener on
+ * every hot update and duplicate all future events.
  */
 
 import { listen } from "@tauri-apps/api/event";
@@ -28,7 +28,17 @@ interface Channel<T> {
   handlers: Set<Handler<T>>;
 }
 
-const channels = new Map<string, Channel<any>>();
+const GLOBAL_KEY = "__msword_use_tauri_event_channels__";
+
+type ChannelMap = Map<string, Channel<any>>;
+
+const channels: ChannelMap = (() => {
+  const g = globalThis as typeof globalThis & { [GLOBAL_KEY]?: ChannelMap };
+  if (!g[GLOBAL_KEY]) {
+    g[GLOBAL_KEY] = new Map();
+  }
+  return g[GLOBAL_KEY];
+})();
 
 function getChannel<T>(name: string): Channel<T> {
   let ch = channels.get(name) as Channel<T> | undefined;

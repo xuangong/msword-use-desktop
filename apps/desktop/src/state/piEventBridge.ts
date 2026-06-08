@@ -77,6 +77,12 @@ export function piEventToDebugEvent(
   const messageId = ctx.reqId ?? undefined;
 
   switch (event.type) {
+    case "agent_start":
+    case "turn_start":
+    case "turn_end":
+    case "message_end":
+      return null;
+
     case "message_start": {
       // Skip ALL message_start events. Rationale:
       //   - For the user message: the UI already echoed it locally when the
@@ -172,9 +178,7 @@ export function piEventToDebugEvent(
       };
   }
 
-  // Note: `case "agent_start" / "turn_start" / "turn_end" / "message_end"` are
-  // all caught by the default branch and surface as system info entries. If
-  // they become noisy, they can be filtered to null here without changing
-  // any other code.
+  // Lifecycle events such as `turn_start` / `message_end` are intentionally
+  // filtered above. They are useful protocol markers, but noisy in this UI.
 }
 

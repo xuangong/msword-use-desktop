@@ -39,12 +39,7 @@ interface SpotlightInvoke {
   preview: string;
 }
 
-type AgentEvent =
-  | { kind: "text_delta"; text: string }
-  | { kind: "tool_call"; id: string; name: string; input: unknown }
-  | { kind: "tool_result"; id: string; name: string; result: unknown }
-  | { kind: "done"; text: string; stopReason: string | null }
-  | { kind: "error"; error: string };
+type AgentEvent = any;
 
 type Phase = "idle" | "thinking" | "tool" | "success" | "error";
 
@@ -114,7 +109,7 @@ export default function SpotlightApp() {
       .catch((err) => dlog("initial pull failed", String(err)));
 
     // 2. Also listen for live invocations while we're already mounted.
-    // Use the module-level singleton so StrictMode / HMR can never produce
+    // Use the browser-process singleton so StrictMode / HMR can never produce
     // >1 Tauri listener for the same channel.
     const offInvoke = onTauriEvent<SpotlightInvoke>("spotlight:invoke", (payload) => {
       applyInvoke(payload);
@@ -123,7 +118,6 @@ export default function SpotlightApp() {
     const offReply = onTauriEvent<string>("bun:reply", (payload) => {
       try {
         const msg = JSON.parse(payload);
-        dlog("reply", msg);
 
         // Sidecar pushes its skills inventory at startup and after every
         // reload — track it so the command palette stays in sync.
@@ -142,35 +136,8 @@ export default function SpotlightApp() {
           return;
         }
 
-        if (msg.kind === "agent_event" && msg.id && msg.id === pendingChatId.current) {
-          const ev: AgentEvent = msg.event;
-          if (ev.kind === "tool_call") {
-            setPhase("tool");
-            setStatusText(`执行 ${ev.name}...`);
-          } else if (ev.kind === "tool_result") {
-            const r = ev.result as any;
-            if (r?.ok === false) {
-              setPhase("error");
-              setStatusText(r?.error ?? "失败");
-            } else if (r?.style) {
-              setStatusText(`${r.style} · ${r.originalChars}→${r.newChars} 字`);
-            }
-          } else if (ev.kind === "text_delta") {
-            setPhase((p) => (p === "tool" ? p : "thinking"));
-          } else if (ev.kind === "done") {
-            setPhase((p) => {
-              if (p === "error") return p;
-              setStatusText((s) => s || "完成");
-              setTimeout(() => invoke("spotlight_hide"), 700);
-              return "success";
-            });
-            pendingChatId.current = null;
-          } else if (ev.kind === "error") {
-            setPhase("error");
-            setStatusText(ev.error);
-            pendingChatId.current = null;
-          }
-        }
+        // Chat agent events are handled only by the polling path below.
+        // Handling them here as well double-applies every text/tool event.
       } catch {
         /* not JSON, ignore */
       }
@@ -317,10 +284,8 @@ export default function SpotlightApp() {
           const msg = JSON.parse(raw);
           dlog("polled chat", msg);
           handleAgentReply(msg);
-          if (msg.kind === "agent_event" && msg.event?.kind === "done") {
-            done = true;
-          }
-          if (msg.kind === "agent_event" && msg.event?.kind === "error") {
+          const t = msg.event?.type ?? msg.event?.kind;
+          if (msg.kind === "agent_event" && (t === "agent_end" || t === "done" || t === "error")) {
             done = true;
           }
         } catch {
@@ -347,20 +312,25 @@ export default function SpotlightApp() {
   const handleAgentReply = useCallback((msg: any) => {
     if (msg.kind !== "agent_event" || msg.id !== pendingChatId.current) return;
     const ev: AgentEvent = msg.event;
-    if (ev.kind === "tool_call") {
+    const type = ev?.type ?? ev?.kind;
+
+    if (type === "tool_execution_start" || type === "tool_call") {
       setPhase("tool");
-      setStatusText(`执行 ${ev.name}...`);
-    } else if (ev.kind === "tool_result") {
-      const r = ev.result as any;
+      setStatusText(`执行 ${ev.toolName ?? ev.name ?? "tool"}...`);
+    } else if (type === "tool_execution_end" || type === "tool_result") {
+      const r = (ev.details ?? ev.result) as any;
       if (r?.ok === false) {
         setPhase("error");
         setStatusText(r?.error ?? "失败");
       } else if (r?.style) {
         setStatusText(`${r.style} · ${r.originalChars}→${r.newChars} 字`);
       }
-    } else if (ev.kind === "text_delta") {
+    } else if (
+      type === "text_delta" ||
+      (type === "message_update" && ev.assistantMessageEvent?.type === "text_delta")
+    ) {
       setPhase((p) => (p === "tool" ? p : "thinking"));
-    } else if (ev.kind === "done") {
+    } else if (type === "agent_end" || type === "done") {
       setPhase((p) => {
         if (p === "error") return p;
         setStatusText((s) => s || "完成");
@@ -368,9 +338,9 @@ export default function SpotlightApp() {
         return "success";
       });
       pendingChatId.current = null;
-    } else if (ev.kind === "error") {
+    } else if (type === "error") {
       setPhase("error");
-      setStatusText(ev.error);
+      setStatusText(ev.error ?? ev.message ?? "失败");
       pendingChatId.current = null;
     }
   }, []);

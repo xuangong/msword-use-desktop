@@ -47,6 +47,66 @@ function rid(): string {
   return Math.random().toString(36).slice(2, 10);
 }
 
+function rememberAgentEvent(seen: Map<string, number>, key: string): boolean {
+  const now = Date.now();
+  if (seen.has(key)) return true;
+  seen.set(key, now);
+
+  // Keep the cache bounded. Streaming events can be numerous, but duplicate
+  // IPC delivery happens immediately, so a short retention window is enough.
+  if (seen.size > 5000) {
+    const cutoff = now - 120_000;
+    for (const [k, ts] of seen) {
+      if (ts < cutoff) seen.delete(k);
+    }
+  }
+  return false;
+}
+
+function sidecarAgentEventKey(sessionId: string, reqId: string | null, event: any): string {
+  const type = event?.type ?? event?.kind ?? "unknown";
+  if (type === "message_update") {
+    const inner = event?.assistantMessageEvent ?? {};
+    return stableKey([
+      sessionId,
+      reqId,
+      type,
+      inner.type,
+      inner.contentIndex,
+      inner.delta ?? inner.content ?? null,
+      // Include the stream position so two natural identical deltas are not
+      // collapsed. Duplicate IPC deliveries carry the same partial/message.
+      inner.partial?.content ?? null,
+      event?.message?.content ?? null,
+    ]);
+  }
+  if (type === "tool_execution_start" || type === "tool_execution_update" || type === "tool_execution_end") {
+    return stableKey([
+      sessionId,
+      reqId,
+      type,
+      event?.toolCallId ?? null,
+      event?.toolName ?? null,
+      event?.args ?? null,
+      event?.partialResult ?? null,
+      event?.result ?? null,
+      event?.isError ?? null,
+    ]);
+  }
+  return stableKey([sessionId, reqId, type, event]);
+}
+
+function stableKey(value: unknown): string {
+  return JSON.stringify(value, (_key, v) => {
+    if (!v || typeof v !== "object" || Array.isArray(v)) return v;
+    const out: Record<string, unknown> = {};
+    for (const k of Object.keys(v).sort()) {
+      out[k] = (v as Record<string, unknown>)[k];
+    }
+    return out;
+  });
+}
+
 async function openPerfWindow() {
   const existing = await WebviewWindow.getByLabel("perf");
   if (existing) {
@@ -109,6 +169,8 @@ export default function App() {
   const idToSession = useRef<Map<string, string>>(new Map());
   /** Polls already running for a given chat id (de-dupe). */
   const polledIds = useRef<Set<string>>(new Set());
+  /** Raw pi events already ingested. Guards against duplicate IPC delivery. */
+  const seenAgentEvents = useRef<Map<string, number>>(new Map());
 
   // ---- IPC ingestion ----
 
@@ -283,6 +345,9 @@ export default function App() {
     // pi-shaped agent event envelope: {sessionId, id, kind:"agent_event", event:<piEvent>}
     if (msg.kind === "agent_event" && msg.event) {
       const reqId: string | null = typeof msg.id === "string" ? msg.id : null;
+      if (rememberAgentEvent(seenAgentEvents.current, sidecarAgentEventKey(sid, reqId, msg.event))) {
+        return;
+      }
       const debugEv = piEventToDebugEvent(
         { sessionId: sid, id: reqId, kind: "agent_event", event: msg.event },
         { reqId },

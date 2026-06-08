@@ -53,6 +53,13 @@ test("message_update with non-text_delta inner → null", () => {
   expect(ev).toBeNull();
 });
 
+test("pi lifecycle events → null", () => {
+  for (const type of ["agent_start", "turn_start", "turn_end", "message_end"]) {
+    const ev = piEventToDebugEvent(envelope({ type }), { reqId: "req_1" });
+    expect(ev).toBeNull();
+  }
+});
+
 test("tool_execution_start → tool_call", () => {
   const ev = piEventToDebugEvent(
     envelope({

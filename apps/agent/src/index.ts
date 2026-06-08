@@ -205,21 +205,6 @@ function enqueueChat(fn: () => Promise<void>): Promise<void> {
   return next;
 }
 
-// ---------- main loop ----------
-
-let buf = "";
-const decoder = new TextDecoder("utf-8");
-for await (const chunk of Bun.stdin.stream()) {
-  buf += decoder.decode(chunk, { stream: true });
-  let nl: number;
-  while ((nl = buf.indexOf("\n")) >= 0) {
-    const line = buf.slice(0, nl).trim();
-    buf = buf.slice(nl + 1);
-    if (!line) continue;
-    handleLine(line);
-  }
-}
-
 function handleLine(line: string) {
   let req: any;
   try {
@@ -276,24 +261,25 @@ interface ChatReq {
 
 async function runChat(req: ChatReq) {
   const { id, sessionId, message, pinnedTarget } = req;
-  const agent = registry.getOrCreate(sessionId);
-  currentPromptId.set(sessionId, id);
-
-  const targetWrapped = pinnedTarget?.paragraphIndex
-    ? composePromptWithTarget(message, pinnedTarget)
-    : message;
-
-  // /skill:<name>  trailing args  — explicit skill invocation.
-  const expanded = expandSkillCommand(targetWrapped);
-
-  // Prepend a runtime context block listing currently-attached references so
-  // the LLM knows about them every turn. Cheap (a few lines) and avoids relying
-  // on the model to remember prior context across turns.
-  const userText = prependReferenceContext(expanded);
-
   try {
+    const agent = registry.getOrCreate(sessionId);
+    currentPromptId.set(sessionId, id);
+
+    const targetWrapped = pinnedTarget?.paragraphIndex
+      ? composePromptWithTarget(message, pinnedTarget)
+      : message;
+
+    // /skill:<name>  trailing args  — explicit skill invocation.
+    const expanded = expandSkillCommand(targetWrapped);
+
+    // Prepend a runtime context block listing currently-attached references so
+    // the LLM knows about them every turn. Cheap (a few lines) and avoids relying
+    // on the model to remember prior context across turns.
+    const userText = prependReferenceContext(expanded);
+
     await agent.prompt(userText);
   } catch (err: any) {
+    process.stderr.write(`[chat] ${sessionId}/${id} failed: ${err?.stack ?? err}\n`);
     write({
       sessionId,
       id,
@@ -513,4 +499,23 @@ async function runShutdown() {
   registry.disposeAll();
   await supervisor.shutdown();
   process.exit(0);
+}
+
+// ---------- main loop ----------
+//
+// Keep this at the very end of the module. `for await` over stdin is a
+// long-lived top-level await; any `const` declarations below it would never be
+// initialized before the first request is handled.
+
+let buf = "";
+const decoder = new TextDecoder("utf-8");
+for await (const chunk of Bun.stdin.stream()) {
+  buf += decoder.decode(chunk, { stream: true });
+  let nl: number;
+  while ((nl = buf.indexOf("\n")) >= 0) {
+    const line = buf.slice(0, nl).trim();
+    buf = buf.slice(nl + 1);
+    if (!line) continue;
+    handleLine(line);
+  }
 }
