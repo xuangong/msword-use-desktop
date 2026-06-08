@@ -9,9 +9,12 @@
   ],
   "scripts": {
     "driver:build": "cd drivers/WordDriver && dotnet build -c Debug",
+    "driver:build:release": "cd drivers/WordDriver && dotnet build -c Release",
     "driver:test": "bun run scripts/test-driver.ts",
     "dev": "cd apps/desktop && bun run tauri dev",
-    "build": "bun run driver:build && cd apps/desktop && bun run tauri build",
+    "package:prepare": "bun run scripts/prepare-windows-package.ts",
+    "package:windows": "bun run package:prepare && cd apps/desktop && bun run tauri build",
+    "build": "bun run package:windows",
     "spike": "drivers/WordDriver/bin/Debug/net48/WordDriver.exe"
   },
   "devDependencies": {

@@ -17,6 +17,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
+use tauri::path::BaseDirectory;
 use tauri::{AppHandle, Emitter, EventTarget, Manager};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
@@ -437,6 +438,49 @@ fn which_on_path(name: &str) -> Result<std::path::PathBuf, ()> {
 }
 
 fn spawn_sidecar(app: &AppHandle) -> Result<Child, String> {
+    if let Some(sidecar_exe) = packaged_resource(app, "resources/sidecars/msword-agent.exe") {
+        let driver_exe = packaged_resource(app, "resources/word-driver/WordDriver.exe")
+            .ok_or("packaged WordDriver.exe not found in resources/word-driver")?;
+        let bundle_root = packaged_resource(app, "resources/agent-bundle")
+            .ok_or("packaged agent bundle not found in resources/agent-bundle")?;
+        let cwd = sidecar_exe
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| bundle_root.clone());
+
+        eprintln!(
+            "[main] spawning packaged sidecar: {:?} (driver={:?}, bundle={:?})",
+            sidecar_exe, driver_exe, bundle_root,
+        );
+        let mut child = Command::new(&sidecar_exe)
+            .current_dir(&cwd)
+            .env("MSWORD_DRIVER_EXE", &driver_exe)
+            .env("MSWORD_BUNDLE_ROOT", &bundle_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("spawn packaged sidecar ({:?}): {}", sidecar_exe, e))?;
+
+        let stdin = child.stdin.take().ok_or("no stdin")?;
+        SIDECAR_STDIN
+            .set(Mutex::new(stdin))
+            .map_err(|_| "sidecar stdin already set")?;
+
+        pipe_sidecar_output(app, child)
+    } else {
+        spawn_dev_sidecar(app)
+    }
+}
+
+fn packaged_resource(app: &AppHandle, rel: &str) -> Option<std::path::PathBuf> {
+    app.path()
+        .resolve(rel, BaseDirectory::Resource)
+        .ok()
+        .filter(|p| p.exists())
+}
+
+fn spawn_dev_sidecar(app: &AppHandle) -> Result<Child, String> {
     let repo_root = {
         let mut p = std::env::current_dir().map_err(|e| e.to_string())?;
         p.pop(); // -> apps/desktop
@@ -466,6 +510,10 @@ fn spawn_sidecar(app: &AppHandle) -> Result<Child, String> {
         .set(Mutex::new(stdin))
         .map_err(|_| "sidecar stdin already set")?;
 
+    pipe_sidecar_output(app, child)
+}
+
+fn pipe_sidecar_output(app: &AppHandle, mut child: Child) -> Result<Child, String> {
     let stdout = child.stdout.take().ok_or("no stdout")?;
     let app_handle = app.clone();
     std::thread::spawn(move || {

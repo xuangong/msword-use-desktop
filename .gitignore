@@ -10,6 +10,7 @@ bun.lockb
 target/
 **/Cargo.lock
 apps/desktop/src-tauri/binaries/
+apps/desktop/src-tauri/resources/
 
 # .NET
 bin/

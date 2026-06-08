@@ -22,6 +22,9 @@ import { resolve, join } from "node:path";
 import { userSkillsDir, userDocsDir } from "./config";
 
 function bundleDir(subdir: "skills" | "docs"): string {
+  const packagedRoot = process.env.MSWORD_BUNDLE_ROOT?.trim();
+  if (packagedRoot) return resolve(packagedRoot, subdir);
+
   // import.meta.dir = apps/agent/src/lib in dev
   return resolve(import.meta.dir, "..", "..", subdir);
 }
