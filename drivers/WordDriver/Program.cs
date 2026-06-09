@@ -44,6 +44,10 @@ namespace MswordUse.WordDriver
 
                 var id = req["id"]?.ToString();
                 var code = req["code"]?.ToString() ?? "";
+                // Optional: hwnd of the Word window the user invoked from.
+                // Roslyn.Host uses it to pick the right Document among
+                // multiple open ones (App.ActiveDocument is unreliable).
+                long triggerHwnd = req["triggerHwnd"]?.ToObject<long?>() ?? 0L;
 
                 // Test/shutdown pseudo-codes (kept verbatim from v0.3 for the
                 // existing supervisor hang test).
@@ -118,7 +122,7 @@ namespace MswordUse.WordDriver
                     using (Perf.Scope(id, "exec_csharp"))
                     {
                         var sw = System.Diagnostics.Stopwatch.StartNew();
-                        er = Roslyn.Host.Run(code);
+                        er = Roslyn.Host.Run(code, triggerHwnd);
                         sw.Stop();
                         Perf.Record("exec_csharp", sw.ElapsedTicks * 1000_000L / System.Diagnostics.Stopwatch.Frequency, code.Length);
                     }

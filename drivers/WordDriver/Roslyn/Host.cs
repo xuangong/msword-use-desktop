@@ -101,7 +101,7 @@ namespace MswordUse.WordDriver.Roslyn
             return _cachedOptions;
         }
 
-        public static ExecResult Run(string code)
+        public static ExecResult Run(string code, long triggerHwnd = 0)
         {
             if (string.IsNullOrWhiteSpace(code))
                 return new ExecResult { Error = "empty_code" };
@@ -117,7 +117,20 @@ namespace MswordUse.WordDriver.Roslyn
             {
                 try
                 {
-                    doc = WordSession.ActiveDoc();
+                    // Pin to the user's trigger window when we have an HWND —
+                    // App.ActiveDocument is application-level and unreliable
+                    // when multiple Word docs are open. Fall back to
+                    // ActiveDoc() only when no hwnd was provided OR the hwnd
+                    // doesn't match any window (e.g. user closed the doc
+                    // between hotkey press and tool invocation).
+                    if (triggerHwnd != 0)
+                    {
+                        doc = WordSession.DocByHwnd(triggerHwnd);
+                    }
+                    if (doc == null)
+                    {
+                        doc = WordSession.ActiveDoc();
+                    }
                     app = doc.Application;
                     refs = WordSession.References();
                 }

@@ -56,7 +56,15 @@ function formatText(args: { result: unknown; stdout: string; error: string | nul
   return `${head}\nstdout:\n${stdout ?? ""}`;
 }
 
-export function makeExecCsharpTool(supervisor: Supervisor): AgentTool<typeof ExecParams, ExecDetails> {
+export function makeExecCsharpTool(
+  supervisor: Supervisor,
+  /** Returns the HWND of the Word window the current chat session should
+   *  operate on. 0 means "no pin — fall back to App.ActiveDocument" (used
+   *  by tests / pre-spotlight callers). Called fresh on every tool execute
+   *  so an agent reused across hotkey invocations always sees the latest
+   *  trigger window. */
+  getTriggerHwnd: () => number = () => 0,
+): AgentTool<typeof ExecParams, ExecDetails> {
   return {
     name: "exec_csharp",
     label: "exec_csharp",
@@ -84,7 +92,7 @@ export function makeExecCsharpTool(supervisor: Supervisor): AgentTool<typeof Exe
 
       let resp;
       try {
-        resp = await supervisor.runScript(code);
+        resp = await supervisor.runScript(code, getTriggerHwnd());
       } catch (err) {
         // HangError → driver was killed + respawned. Return error text so the
         // LLM sees it and can retry with a smaller/different script.

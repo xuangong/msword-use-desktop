@@ -85,13 +85,19 @@ export class DriverClient {
     }
   }
 
-  /** Run a C# script in the live Word session. */
-  async runScript(code: string): Promise<DriverResponse> {
+  /** Run a C# script in the live Word session.
+   *  triggerHwnd, when set, pins the Doc/App globals to the Word window with
+   *  that HWND (so the agent always operates on the document the user
+   *  invoked the hotkey from, not whichever doc Word's app-level
+   *  ActiveDocument happens to be). */
+  async runScript(code: string, triggerHwnd: number = 0): Promise<DriverResponse> {
     if (this.closed) {
       throw new DriverError("driver already exited");
     }
     const id = String(this.nextId++);
-    const req = JSON.stringify({ id, code });
+    const req = JSON.stringify(
+      triggerHwnd ? { id, code, triggerHwnd } : { id, code },
+    );
     return await new Promise<DriverResponse>((resolve) => {
       this.pending.set(id, resolve);
       this.proc.stdin.write(req + "\n");

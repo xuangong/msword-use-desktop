@@ -19,6 +19,10 @@ export interface SessionEntry<TAgent> {
   agent: TAgent;
   createdAt: number;
   lastUsed: number;
+  /** HWND of the Word window the agent is pinned to. Refreshed on every
+   *  prompt/steer so subsequent exec_csharp calls hit the right document
+   *  even if the user has multiple Word docs open. 0 = use ActiveDocument. */
+  triggerHwnd: number;
 }
 
 export interface SessionRegistryOptions<TAgent> {
@@ -61,8 +65,23 @@ export class SessionRegistry<TAgent> {
     this.evictToCap(this.opts.maxSessions - 1);
     const now = this.opts.now();
     const agent = this.opts.agentFactory(sessionId);
-    this.entries.set(sessionId, { agent, createdAt: now, lastUsed: now });
+    this.entries.set(sessionId, { agent, createdAt: now, lastUsed: now, triggerHwnd: 0 });
     return agent;
+  }
+
+  /** Update the Word HWND this session's agent should pin against on the
+   *  next exec_csharp. Called on every chat / steer with a hwnd in the
+   *  payload. No-op if the session doesn't exist (caller should
+   *  getOrCreate first). */
+  setTriggerHwnd(sessionId: string, hwnd: number): void {
+    const entry = this.entries.get(sessionId);
+    if (entry) entry.triggerHwnd = hwnd;
+  }
+
+  /** Return the pinned HWND for the given session, or 0 if none /
+   *  session unknown. */
+  getTriggerHwnd(sessionId: string): number {
+    return this.entries.get(sessionId)?.triggerHwnd ?? 0;
   }
 
   /** True iff this sid currently has an Agent in the registry. */

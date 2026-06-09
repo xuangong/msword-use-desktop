@@ -18,7 +18,7 @@ import {
  * satisfies this; tests pass a mock to avoid spawning a real driver.
  */
 export interface DriverClientLike {
-  runScript(code: string): Promise<DriverResponse>;
+  runScript(code: string, triggerHwnd?: number): Promise<DriverResponse>;
   kill(): void;
   exited(): Promise<number>;
   isClosed?(): boolean;
@@ -56,10 +56,12 @@ export class Supervisor {
     return this.gen;
   }
 
-  /** Run a C# script in the driver, with hang detection + restart on timeout. */
-  async runScript(code: string): Promise<DriverResponse> {
+  /** Run a C# script in the driver, with hang detection + restart on timeout.
+   *  triggerHwnd pins which Word document the script's Doc/App globals point
+   *  at. 0 / undefined falls back to App.ActiveDocument. */
+  async runScript(code: string, triggerHwnd: number = 0): Promise<DriverResponse> {
     await this.ensureAlive();
-    return await this.runWithTimeout(() => this.client.runScript(code));
+    return await this.runWithTimeout(() => this.client.runScript(code, triggerHwnd));
   }
 
   /**

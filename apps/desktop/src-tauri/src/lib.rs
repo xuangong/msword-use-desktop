@@ -262,7 +262,7 @@ fn show_spotlight(app: &AppHandle) {
     // Snapshot fetch: only worth attempting if the foreground is actually Word.
     // Otherwise we'd spend 2s waiting for a script that's guaranteed to error.
     if invoke.is_word {
-        let snap = fetch_snapshot_blocking(invoke.seq);
+        let snap = fetch_snapshot_blocking(invoke.seq, invoke.trigger_hwnd);
         invoke.paragraph_index = snap.paragraph_index;
         invoke.preview = snap.preview;
     }
@@ -292,7 +292,7 @@ struct SpotlightSnapshot {
 /// wait up to 2s for the matching reply. On any failure (sidecar not up, no
 /// reply within budget, parse error, driver error), returns the default
 /// (no paragraph index, empty preview) — snapshot is best-effort.
-fn fetch_snapshot_blocking(seq: u64) -> SpotlightSnapshot {
+fn fetch_snapshot_blocking(seq: u64, trigger_hwnd: u64) -> SpotlightSnapshot {
     let id = format!("snap_{}_{}", seq, std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -302,6 +302,10 @@ fn fetch_snapshot_blocking(seq: u64) -> SpotlightSnapshot {
         "kind": "raw",
         "id": id,
         "code": SNAPSHOT_SCRIPT,
+        // Pin the snapshot to the user's foreground Word window so the
+        // preview reflects the doc they actually pressed Ctrl+Alt+J in,
+        // not whichever doc happens to be App.ActiveDocument.
+        "triggerHwnd": trigger_hwnd,
     });
     let line = match serde_json::to_string(&payload) {
         Ok(s) => s,

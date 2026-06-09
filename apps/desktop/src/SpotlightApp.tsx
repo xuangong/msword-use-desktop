@@ -342,14 +342,19 @@ export default function SpotlightApp() {
     // The paragraph snapshot was captured by Rust at hotkey time and arrived
     // via the spotlight:invoke event in `ctx`.
     const payload: any = { kind: "chat", id, sessionId, message };
-    if (ctx && ctx.paragraph_index != null) {
+    // Always pin the trigger HWND when ctx is present, even when there's no
+    // selection — the agent should still operate on the right Word window.
+    // pinnedTarget lives even without a paragraphIndex now (sidecar handles
+    // partial fields).
+    if (ctx) {
       payload.pinnedTarget = {
-        paragraphIndex: ctx.paragraph_index,
+        paragraphIndex: ctx.paragraph_index ?? undefined,
         preview: ctx.preview,
+        triggerHwnd: ctx.trigger_hwnd,
       };
       dlog("payload includes pinnedTarget", payload.pinnedTarget);
     } else {
-      dlog("no pinnedTarget — ctx missing paragraph_index", { ctx });
+      dlog("no ctx — chat will fall back to ActiveDocument", {});
     }
 
     try {

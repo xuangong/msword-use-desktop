@@ -141,6 +141,9 @@ const agentFactory = makeAgentFactory({
   supervisor,
   getSkills: () => currentSkills,
   config,
+  // Wired below — we hand the registry's getter to the factory so each
+  // exec_csharp closure resolves the latest hwnd for its session at call time.
+  getTriggerHwnd: (sid) => registry.getTriggerHwnd(sid),
 });
 
 /** sid → request id of the in-flight prompt, if any. Used to tag events. */
@@ -259,6 +262,9 @@ interface PinnedTarget {
   selectionStart?: number;
   selectionEnd?: number;
   selectionEmpty?: boolean;
+  /** HWND of the Word window the user invoked from. Drives which Document
+   *  the driver's Doc/App globals point at — see WordSession.DocByHwnd. */
+  triggerHwnd?: number;
 }
 
 interface ChatReq {
@@ -273,6 +279,11 @@ async function runChat(req: ChatReq) {
   const { id, sessionId, message, pinnedTarget } = req;
   try {
     const agent = registry.getOrCreate(sessionId);
+    // Refresh the pinned HWND BEFORE prompt() so the very first exec_csharp
+    // call from this turn already targets the right Word window. Persist 0
+    // explicitly when the request has no hwnd, so a stale pin from a
+    // previous turn doesn't leak (e.g. user retried from a different window).
+    registry.setTriggerHwnd(sessionId, pinnedTarget?.triggerHwnd ?? 0);
     currentPromptId.set(sessionId, id);
 
     await agent.prompt(prepareUserText(message, pinnedTarget));
@@ -293,6 +304,9 @@ function runSteer(req: ChatReq) {
   const { id, sessionId, message, pinnedTarget } = req;
   try {
     const agent = registry.getOrCreate(sessionId);
+    // Same as runChat: refresh the pin so a steer from a different Word
+    // window retargets the active turn's exec_csharp calls.
+    registry.setTriggerHwnd(sessionId, pinnedTarget?.triggerHwnd ?? 0);
     const activePromptId = currentPromptId.get(sessionId) ?? null;
     const userText = prepareUserText(`[补充上下文]\n${message}`, pinnedTarget);
     agent.steer(toUserMessage(userText));
@@ -468,12 +482,17 @@ function runListReferences(req: ListRefReq) {
 interface RawReq {
   id: string;
   code: string;
+  /** Optional HWND to pin the Doc/App globals against. Used by Tauri's
+   *  spotlight snapshot fetch so the preview/paragraph index reflect the
+   *  Word window the user invoked from, not whatever doc happens to be
+   *  App.ActiveDocument. */
+  triggerHwnd?: number;
 }
 
 async function runRaw(req: RawReq) {
-  const { id, code } = req;
+  const { id, code, triggerHwnd } = req;
   try {
-    const resp = await supervisor.runScript(code);
+    const resp = await supervisor.runScript(code, triggerHwnd ?? 0);
     write({
       id,
       kind: "raw_response",

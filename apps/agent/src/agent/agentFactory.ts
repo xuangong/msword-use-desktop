@@ -36,6 +36,13 @@ export interface AgentFactoryDeps {
   config: MswordUseConfig;
   /** Override for tests — defaults to config.apiKey. */
   getApiKey?: (provider: string) => Promise<string | undefined>;
+  /**
+   * Resolve the Word HWND that exec_csharp should pin against for a given
+   * session. The sidecar updates this map on every chat/steer so a long-lived
+   * agent always operates on the document the user most recently invoked
+   * the spotlight from. Default returns 0 (no pin → ActiveDocument fallback).
+   */
+  getTriggerHwnd?: (sessionId: string) => number;
 }
 
 const DEFAULT_PROVIDER = "anthropic";
@@ -73,11 +80,12 @@ export function makeAgentFactory(deps: AgentFactoryDeps): (sessionId: string) =>
     if (stripThinking) (model as any).reasoning = undefined;
   }
 
-  const execCsharp = makeExecCsharpTool(deps.supervisor);
-  const tools = [execCsharp, readTool];
+  const getHwnd = deps.getTriggerHwnd ?? (() => 0);
 
-  return (_sessionId: string) =>
-    new Agent({
+  return (sessionId: string) => {
+    const execCsharp = makeExecCsharpTool(deps.supervisor, () => getHwnd(sessionId));
+    const tools = [execCsharp, readTool];
+    return new Agent({
       initialState: {
         systemPrompt: buildSystemPrompt(deps.getSkills()),
         model: model as any, // pi-ai's strong types fight bun-types narrowing here.
@@ -93,4 +101,5 @@ export function makeAgentFactory(deps: AgentFactoryDeps): (sessionId: string) =>
         );
       },
     });
+  };
 }

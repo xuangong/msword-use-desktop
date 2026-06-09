@@ -16,6 +16,22 @@ namespace MswordUse.WordDriver
     /// </summary>
     static class WordSession
     {
+        // P/Invoke: Word.Window.Hwnd returns the *content* window (_WwG / _WwF
+        // class), but Win32's GetForegroundWindow gives the top-level OpusApp
+        // shell window — different ancestors of the same logical window.
+        // GetAncestor(hwnd, GA_ROOT) climbs to the top-level so we can compare
+        // against the trigger HWND captured by Tauri's capture_foreground().
+        [DllImport("user32.dll")]
+        static extern IntPtr GetAncestor(IntPtr hwnd, uint gaFlags);
+        const uint GA_ROOT = 2;
+
+        static IntPtr ToRoot(IntPtr h)
+        {
+            if (h == IntPtr.Zero) return h;
+            try { var r = GetAncestor(h, GA_ROOT); return r == IntPtr.Zero ? h : r; }
+            catch { return h; }
+        }
+
         static Word.Application _app;
 
         // HRESULTs that indicate the cached COM pointer is dead (or no Word is
@@ -78,6 +94,56 @@ namespace MswordUse.WordDriver
                 if (fresh.Documents.Count == 0) throw new Exception("no active document");
                 return fresh.ActiveDocument;
             }
+        }
+
+        /// <summary>
+        /// Resolve the Word.Document whose top-level window has the given HWND.
+        /// Used to pin the agent to the EXACT Word window the user invoked the
+        /// hotkey from, instead of trusting App.ActiveDocument (which is
+        /// application-level and lags behind / points at the wrong window when
+        /// the user has multiple Word documents open).
+        ///
+        /// Returns null when no window matches — caller should fall back to
+        /// ActiveDoc() and surface the mismatch to the user.
+        /// </summary>
+        public static Word.Document DocByHwnd(long hwnd)
+        {
+            if (hwnd == 0) return null;
+            var target = new IntPtr(hwnd);
+            var app = App();
+            try
+            {
+                foreach (Word.Window w in app.Windows)
+                {
+                    try
+                    {
+                        var raw = new IntPtr(w.Hwnd);
+                        var rootHwnd = ToRoot(raw);
+                        Console.Error.WriteLine(string.Format(
+                            "[DocByHwnd] candidate doc={0} raw=0x{1:X} root=0x{2:X} target=0x{3:X}",
+                            w.Document?.Name ?? "(null)", raw.ToInt64(), rootHwnd.ToInt64(), target.ToInt64()));
+                        if (rootHwnd == target || raw == target) return w.Document;
+                    }
+                    catch (COMException) { /* dead window in the collection, skip */ }
+                }
+            }
+            catch (COMException ex) when (IsDisconnected(ex))
+            {
+                _app = null;
+                var fresh = App();
+                foreach (Word.Window w in fresh.Windows)
+                {
+                    try
+                    {
+                        var raw = new IntPtr(w.Hwnd);
+                        var rootHwnd = ToRoot(raw);
+                        if (rootHwnd == target || raw == target) return w.Document;
+                    }
+                    catch (COMException) { }
+                }
+            }
+            Console.Error.WriteLine(string.Format("[DocByHwnd] NO MATCH for target=0x{0:X}", target.ToInt64()));
+            return null;
         }
 
         /// <summary>
