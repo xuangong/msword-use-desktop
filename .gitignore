@@ -36,5 +36,8 @@ apps/desktop/config.json
 ~$*.docx
 ~$*.doc
 
+# Dev / runtime logs
+*.log
+
 # Local Claude config
 .claude/
