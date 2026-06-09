@@ -479,6 +479,16 @@ export default function App() {
   // On mount, sync sidecar status (HMR-safe) + register as reply subscriber.
   useEffect(() => {
     invoke("register_subscriber", { name: "main" }).catch(() => {});
+    // Ask the sidecar for its current skills inventory so /commands shows
+    // skill entries (not just the builtin /reload-skills). The sidecar will
+    // also broadcast skills:list on startup, but that fires before this
+    // window is registered as a subscriber, so we'd miss it on cold start.
+    invoke("bun_send", {
+      line: JSON.stringify({
+        kind: "list-skills",
+        id: `skills:${Math.random().toString(36).slice(2, 10)}`,
+      }),
+    }).catch(() => {});
     invoke<{ ready: boolean; gen: number }>("app_status")
       .then((s) => {
         if (s.ready) {
@@ -648,10 +658,31 @@ export default function App() {
       return;
     }
 
-    // Raw response (sidecar broadcasts driver RPC results). The spotlight
-    // window consumes its own raw replies; main window can ignore.
+    // Raw response (sidecar broadcasts driver RPC results). Render it as a
+    // driver_recv event so the user can see the result of `/<rpc>` slash
+    // commands like `/_perf.summary` or `/_ref_list`.
     if (msg.kind === "raw_response") {
       markDone(msg.id);
+      if (msg.error) {
+        appendEvent({
+          id: rid(),
+          ts: Date.now(),
+          sessionId: sid,
+          kind: "driver_recv",
+          requestId: msg.id,
+          error: msg.error,
+        });
+      } else {
+        appendEvent({
+          id: rid(),
+          ts: Date.now(),
+          sessionId: sid,
+          kind: "driver_recv",
+          requestId: msg.id,
+          result: msg.result,
+          error: null,
+        });
+      }
       return;
     }
 
@@ -735,7 +766,6 @@ export default function App() {
     if (!textOverride) setInput("");
     setLastSent(line);
 
-    const isRaw = line.startsWith("/");
     const id = `chat-${rid()}`;
     // Use existing session if any, else create a new one.
     const sid = currentSessionId ?? `s-${rid()}`;
@@ -804,79 +834,38 @@ export default function App() {
       return;
     }
 
-    if (isRaw) {
-      const parts = line.slice(1).split(/\s+/);
-      const method = parts[0];
-      let params: any = {};
-      if (parts.length > 1) {
-        try {
-          params = JSON.parse(parts.slice(1).join(" "));
-        } catch {
-          params = {};
-        }
-      }
-      const code =
-        params == null || (typeof params === "object" && Object.keys(params).length === 0)
-          ? method
-          : `${method}:${JSON.stringify(params)}`;
-      const payload = { kind: "raw", id, code };
+    appendEvent({
+      id: rid(),
+      ts: Date.now(),
+      sessionId: sid,
+      messageId: id,
+      kind: "user_message",
+      text: line,
+    });
+    markPending(id, sid);
+    try {
+      const ctxForRequest = await refreshWordContext(sid, "manual");
+      const pinnedTarget = pinnedTargetFromCtx(ctxForRequest ?? wordCtx);
+      const payload: any = {
+        kind: "chat",
+        id,
+        sessionId: sid,
+        mode: wasPending ? "steer" : "prompt",
+        message: line,
+      };
+      if (pinnedTarget) payload.pinnedTarget = pinnedTarget;
+      await invoke("bun_send", { line: JSON.stringify(payload) });
+      startPollChat(id, sid);
+    } catch (err) {
       appendEvent({
         id: rid(),
         ts: Date.now(),
         sessionId: sid,
-        kind: "driver_send",
-        method: method ?? "",
-        params,
-        requestId: id,
+        kind: "system",
+        text: `invoke failed: ${err}`,
+        severity: "error",
       });
-      markPending(id, sid);
-      try {
-        await invoke("bun_send", { line: JSON.stringify(payload) });
-      } catch (err) {
-        appendEvent({
-          id: rid(),
-          ts: Date.now(),
-          sessionId: sid,
-          kind: "system",
-          text: `invoke failed: ${err}`,
-          severity: "error",
-        });
-        markDone(id);
-      }
-    } else {
-      appendEvent({
-        id: rid(),
-        ts: Date.now(),
-        sessionId: sid,
-        messageId: id,
-        kind: "user_message",
-        text: line,
-      });
-      markPending(id, sid);
-      try {
-        const ctxForRequest = await refreshWordContext(sid, "manual");
-        const pinnedTarget = pinnedTargetFromCtx(ctxForRequest ?? wordCtx);
-        const payload: any = {
-          kind: "chat",
-          id,
-          sessionId: sid,
-          mode: wasPending ? "steer" : "prompt",
-          message: line,
-        };
-        if (pinnedTarget) payload.pinnedTarget = pinnedTarget;
-        await invoke("bun_send", { line: JSON.stringify(payload) });
-        startPollChat(id, sid);
-      } catch (err) {
-        appendEvent({
-          id: rid(),
-          ts: Date.now(),
-          sessionId: sid,
-          kind: "system",
-          text: `invoke failed: ${err}`,
-          severity: "error",
-        });
-        markDone(id);
-      }
+      markDone(id);
     }
   }
 
@@ -1047,7 +1036,7 @@ export default function App() {
             驱动 {driverReady ? `gen=${driverGen ?? "?"}` : <BootTimer startedAt={mountedAt.current} />}
           </span>
           <span className="hidden 2xl:inline text-neutral-400 whitespace-nowrap">
-            指令前加 <code className="bg-neutral-100 px-1 rounded">/</code> 走原始 RPC
+            输入 <code className="bg-neutral-100 px-1 rounded">/</code> 查看可用命令
           </span>
         </div>
       </header>
@@ -1085,7 +1074,7 @@ export default function App() {
                   // falls through to form submit on Enter.
                   palette.handleKey(e);
                 }}
-                placeholder={pending ? "运行中，可继续补充上下文..." : "请说... (输入 / 看命令；/ping 走原始 RPC)"}
+                placeholder={pending ? "运行中，可继续补充上下文..." : "请说... (输入 / 看可用命令)"}
                 className="flex-1 border border-neutral-300 rounded px-3 py-2 text-sm"
               />
               <span
@@ -1134,10 +1123,8 @@ export default function App() {
           </form>
         </div>
 
-        {/* Right: debug panel */}
-        <aside className="w-96 border-l border-neutral-200 bg-white overflow-hidden shrink-0 flex flex-col">
-          <DebugPanel events={events} />
-        </aside>
+        {/* Right: debug panel — collapsible */}
+        <DebugPanelAside events={events} />
       </div>
     </main>
   );
@@ -1222,10 +1209,28 @@ function ToolCallView({ tc }: { tc: ToolCall }) {
   const status = tc.result == null ? "pending" : tc.ok === false ? "error" : "ok";
   const dot =
     status === "ok" ? "bg-green-500" : status === "error" ? "bg-red-500" : "bg-amber-500 animate-pulse";
-  const summary = useMemo(() => {
+  const inputPreview = useMemo(() => {
     const inp = JSON.stringify(tc.input);
     return inp.length > 60 ? inp.slice(0, 60) + "…" : inp;
   }, [tc.input]);
+  // For failed calls, show the first line of the driver's error message as the
+  // headline so users can see WHY without expanding. Cheap signal that the LLM
+  // is self-correcting.
+  const errorHeadline = useMemo(() => {
+    if (status !== "error") return null;
+    const r = tc.result as any;
+    const raw =
+      (r?.details?.error as string | undefined) ??
+      (r?.content?.[0]?.text as string | undefined) ??
+      "";
+    const firstLine = raw.split("\n")[0]?.trim() ?? "";
+    return firstLine.length > 100 ? firstLine.slice(0, 100) + "…" : firstLine;
+  }, [status, tc.result]);
+
+  const headerCls =
+    status === "error"
+      ? "border-red-200 bg-red-50 hover:bg-red-100"
+      : "border-neutral-200 bg-neutral-50 hover:bg-neutral-100";
 
   return (
     <div className="flex justify-start">
@@ -1233,11 +1238,13 @@ function ToolCallView({ tc }: { tc: ToolCall }) {
         <button
           type="button"
           onClick={() => setOpen((o) => !o)}
-          className="text-left w-full text-xs font-mono border border-neutral-200 bg-neutral-50 rounded px-2 py-1 hover:bg-neutral-100 flex items-center gap-2"
+          className={`text-left w-full text-xs font-mono border rounded px-2 py-1 flex items-center gap-2 ${headerCls}`}
         >
           <span className={`inline-block w-1.5 h-1.5 rounded-full ${dot}`} />
           <span className="text-neutral-700 font-semibold">{tc.name}</span>
-          <span className="text-neutral-500 truncate flex-1">{summary}</span>
+          <span className={`truncate flex-1 ${status === "error" ? "text-red-700" : "text-neutral-500"}`}>
+            {errorHeadline ?? inputPreview}
+          </span>
           <span className="text-neutral-400">{open ? "▾" : "▸"}</span>
         </button>
         {open && (
@@ -1267,7 +1274,50 @@ function ToolCallView({ tc }: { tc: ToolCall }) {
 // Debug panel (right-side)
 // ============================================================
 
-function DebugPanel({ events }: { events: DebugEvent[] }) {
+function DebugPanelAside({ events }: { events: DebugEvent[] }) {
+  const [collapsed, setCollapsed] = useState(() => {
+    return localStorage.getItem("msword-use:debug-collapsed") === "1";
+  });
+  const toggle = () => {
+    setCollapsed((c) => {
+      const next = !c;
+      localStorage.setItem("msword-use:debug-collapsed", next ? "1" : "0");
+      return next;
+    });
+  };
+
+  if (collapsed) {
+    return (
+      <aside className="w-8 border-l border-neutral-200 bg-neutral-50 shrink-0 flex flex-col items-center">
+        <button
+          type="button"
+          onClick={toggle}
+          className="w-full h-full flex flex-col items-center justify-start py-3 hover:bg-neutral-100 text-neutral-500"
+          title="展开事件面板"
+        >
+          <span className="text-xs">◂</span>
+          <span className="text-xs mt-2 [writing-mode:vertical-rl] tracking-wider">
+            事件 {events.length}
+          </span>
+        </button>
+      </aside>
+    );
+  }
+
+  return (
+    <aside className="w-96 border-l border-neutral-200 bg-white overflow-hidden shrink-0 flex flex-col">
+      <DebugPanel events={events} onCollapse={toggle} />
+    </aside>
+  );
+}
+
+function DebugPanel({
+  events,
+  onCollapse,
+}: {
+  events: DebugEvent[];
+  onCollapse: () => void;
+}) {
   const [filter, setFilter] = useState<"all" | DebugEventKind>("all");
   const visible = useMemo(
     () => (filter === "all" ? events : events.filter((e) => e.kind === filter)),
@@ -1301,6 +1351,14 @@ function DebugPanel({ events }: { events: DebugEvent[] }) {
           <option value="driver_recv">driver_recv</option>
           <option value="system">system</option>
         </select>
+        <button
+          type="button"
+          onClick={onCollapse}
+          className="text-neutral-400 hover:text-neutral-700 px-1"
+          title="收起事件面板"
+        >
+          ▸
+        </button>
       </div>
       <div className="flex-1 overflow-auto">
         {reversed.length === 0 ? (
